@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Test Label Generator</title>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+<style>
+  :root{
+    --bg:#101214; --panel:#181b1e; --panel2:#1e2225; --line:#2a2f33;
+    --amber:#ffb020; --text:#e8eaed; --muted:#8b9299; --mono:'SF Mono','JetBrains Mono',Consolas,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding:24px 16px 60px;}
+  .wrap{max-width:640px; margin:0 auto;}
+  h1{font-size:20px; margin:0 0 6px;}
+  .sub{color:var(--muted); font-size:13px; line-height:1.5; margin:0 0 18px;}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:16px;}
+  .field{margin-bottom:10px;}
+  .field label{display:block; font-size:12px; color:var(--muted); margin-bottom:4px;}
+  .field input{width:100%; background:var(--panel2); border:1px solid var(--line); border-radius:6px; color:var(--text); font-family:var(--mono); font-size:13px; padding:8px 10px;}
+  button{font-family:inherit; font-size:13px; font-weight:600; cursor:pointer; border-radius:7px; padding:10px 16px; border:1px solid var(--amber); background:var(--amber); color:#1a1206;}
+  button:hover{background:#ffbd42;}
+  .note{font-size:12px; color:var(--muted); line-height:1.6; margin-top:10px;}
+
+  /* --- the printable label itself --- */
+  #labelOuter{background:#fff; color:#000; width:4in; margin:0 auto; border:1px solid #999; font-family:Arial,Helvetica,sans-serif;}
+  .stripe{background:#ff7a1a; color:#fff; text-align:center; font-weight:800; font-size:13pt; padding:4px 0; letter-spacing:1px;}
+  #labelInner{padding:10px 14px 14px;}
+  .row1{display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;}
+  .tagCircle{width:26px; height:26px; border-radius:50%; background:#000; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:14pt;}
+  .tagCode{font-weight:800; font-size:18pt;}
+  .time{font-size:13pt; font-weight:600; text-align:right;}
+  .trip{font-size:10pt; color:#333; margin-bottom:6px;}
+  .customer{font-size:15pt; font-weight:800; letter-spacing:.5px; margin-bottom:4px;}
+  .orderid{font-size:16pt; font-weight:800; letter-spacing:1px; margin-bottom:8px; font-family:'Courier New',monospace;}
+  .barcodeWrap{text-align:center; margin:6px 0;}
+  .row2{display:flex; justify-content:space-between; font-size:10pt; font-weight:700; border-top:2px solid #000; padding-top:6px; margin-top:4px;}
+
+  @media print {
+    body{background:#fff; padding:0;}
+    .wrap > *:not(#printArea){display:none !important;}
+    #printArea{display:block !important;}
+    #labelOuter{border:none; margin:0;}
+  }
+  #printArea{display:block;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Test label generator</h1>
+  <p class="sub">Prints a label with the same structure as the real Walmart store-delivery tags from your research (tag circle, order ID line, CODE128 barcode) but with placeholder test data — safe to reuse for as many print/scan test rounds as you need without touching real customer info. Order ID follows the real pattern <code>2000&lt;11 digits&gt;</code> so it'll match the scanner app's regex.</p>
+
+  <div class="card">
+    <div class="field"><label>Order ID (15 digits, must start 2000)</label><input type="text" id="orderIdField" value="200099912345678" maxlength="15"></div>
+    <div class="field"><label>Tag code (last 4 digits should match the order ID's last 4, like the real tags)</label><input type="text" id="tagCodeField" value="E5678"></div>
+    <div class="field"><label>Customer name (placeholder, not a real person)</label><input type="text" id="customerField" value="TEST CUSTOMER"></div>
+    <div class="field"><label>Time</label><input type="text" id="timeField" value="9:00 AM"></div>
+    <div class="field"><label>Trip code</label><input type="text" id="tripField" value="Trip:t001"></div>
+    <div class="field"><label>Date</label><input type="text" id="dateField" value="23-Aug"></div>
+    <button id="renderBtn">Update label</button>
+    <p class="note">After updating, use your browser's <strong>Print</strong> (Cmd/Ctrl+P) and print at <strong>100% scale</strong> — "Fit to page" will shrink the text and defeat the point of the test. A single sheet of plain paper is fine.</p>
+  </div>
+
+  <div id="printArea">
+    <div id="labelOuter">
+      <div class="stripe">PEEL HERE</div>
+      <div id="labelInner">
+        <div class="row1">
+          <div class="tagCircle" id="tagCircle">1</div>
+          <div class="tagCode" id="tagCodeOut">E5678</div>
+          <div class="time" id="timeOut">9:00 AM</div>
+        </div>
+        <div class="trip" id="tripOut">GMD Trip:t001</div>
+        <div class="customer" id="customerOut">TEST CUSTOMER</div>
+        <div class="orderid" id="orderIdOut">200099912345678</div>
+        <div class="barcodeWrap"><svg id="barcodeSvg"></svg></div>
+        <div class="row2">
+          <span>W+ AMBIENT</span>
+          <span id="dateOut">23-Aug</span>
+          <span id="tagCodeOut2">E5678</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function render() {
+  const orderId = document.getElementById('orderIdField').value.trim();
+  const tagCode = document.getElementById('tagCodeField').value.trim();
+  const customer = document.getElementById('customerField').value.trim();
+  const time = document.getElementById('timeField').value.trim();
+  const trip = document.getElementById('tripField').value.trim();
+  const date = document.getElementById('dateField').value.trim();
+
+  document.getElementById('tagCodeOut').textContent = tagCode;
+  document.getElementById('tagCodeOut2').textContent = tagCode;
+  document.getElementById('timeOut').textContent = time;
+  document.getElementById('tripOut').textContent = 'GMD ' + trip;
+  document.getElementById('customerOut').textContent = customer;
+  document.getElementById('orderIdOut').textContent = orderId;
+  document.getElementById('dateOut').textContent = date;
+
+  try {
+    JsBarcode('#barcodeSvg', tagCode, { format: 'CODE128', width: 2, height: 40, displayValue: false, margin: 0 });
+  } catch (e) {
+    document.getElementById('barcodeSvg').outerHTML = '<span style="font-size:10pt;color:#900;">Barcode error: ' + e.message + '</span>';
+  }
+}
+document.getElementById('renderBtn').addEventListener('click', render);
+window.addEventListener('load', render);
+</script>
+</body>
+</html>
