@@ -342,6 +342,30 @@ async function setHeaderRow(tab, headers) {
 // ==================================================================
 // OAuth
 // ==================================================================
+// Google's access tokens are short-lived (~1hr) by design, but caching one
+// in localStorage means a page reload mid-shift resumes instantly instead
+// of forcing a full re-login every time — the tradeoff is that anyone with
+// access to this device's browser storage could reuse it until it expires,
+// which is an acceptable tradeoff for a device the warehouse team controls,
+// but worth knowing.
+function saveTokenCache(resp) {
+  try {
+    const expiresAt = Date.now() + (resp.expires_in ? resp.expires_in * 1000 : 3500 * 1000);
+    localStorage.setItem('wst_gtoken', JSON.stringify({ access_token: resp.access_token, expires_at: expiresAt }));
+  } catch (e) {}
+}
+
+function loadTokenCache() {
+  try {
+    const raw = localStorage.getItem('wst_gtoken');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    // 60s safety margin so a request doesn't start on a token that expires mid-flight.
+    if (parsed && parsed.access_token && parsed.expires_at > Date.now() + 60000) return parsed;
+  } catch (e) {}
+  return null;
+}
+
 function initTokenClient() {
   if (tokenClient || !window.google || !google.accounts) return;
   tokenClient = google.accounts.oauth2.initTokenClient({
@@ -350,6 +374,7 @@ function initTokenClient() {
     callback: (resp) => {
       if (resp.access_token) {
         accessToken = resp.access_token;
+        saveTokenCache(resp);
         setStatus('sheetStatus', 'Connected — paste your sheet URL, then click Initialize.', 'ok');
         document.getElementById('connectBtn').textContent = 'Reconnect';
         document.getElementById('initBtn').disabled = false;
@@ -366,7 +391,35 @@ document.getElementById('connectBtn').addEventListener('click', () => {
   }
   tokenClient.requestAccessToken();
 });
-window.addEventListener('load', initTokenClient);
+
+function restoreSavedSheetConfig() {
+  const savedUrl = localStorage.getItem('wst_sheetUrl');
+  if (savedUrl) document.getElementById('sheetUrlInput').value = savedUrl;
+  const savedOrders = localStorage.getItem('wst_ordersTab');
+  if (savedOrders) document.getElementById('ordersTabInput').value = savedOrders;
+  const savedInv = localStorage.getItem('wst_inventoryTab');
+  if (savedInv) document.getElementById('inventoryTabInput').value = savedInv;
+  const savedMove = localStorage.getItem('wst_movementsTab');
+  if (savedMove) document.getElementById('movementsTabInput').value = savedMove;
+  return !!savedUrl;
+}
+
+window.addEventListener('load', async () => {
+  initTokenClient();
+  const hasSheetConfig = restoreSavedSheetConfig();
+  const cached = loadTokenCache();
+  if (cached) {
+    accessToken = cached.access_token;
+    document.getElementById('connectBtn').textContent = 'Reconnect';
+    document.getElementById('initBtn').disabled = false;
+    if (hasSheetConfig) {
+      setStatus('sheetStatus', 'Resumed previous sign-in — reconnecting to your sheet…', 'ok');
+      await runInitializeSheet();
+    } else {
+      setStatus('sheetStatus', 'Resumed previous sign-in — paste your sheet URL, then click Initialize.', 'ok');
+    }
+  }
+});
 
 // ==================================================================
 // Sheet initialization — creates/detects Orders, Inventory, Movements tabs
@@ -451,7 +504,7 @@ async function ensureMovementsTab(existingTabs, tabName) {
   return [`Using existing "${tabName}" tab.`];
 }
 
-document.getElementById('initBtn').addEventListener('click', async () => {
+async function runInitializeSheet() {
   const idInput = document.getElementById('sheetUrlInput').value.trim();
   if (!idInput) { setStatus('sheetStatus', 'Paste your sheet URL or ID first.', 'bad'); return; }
   spreadsheetId = extractSpreadsheetId(idInput);
@@ -485,10 +538,18 @@ document.getElementById('initBtn').addEventListener('click', async () => {
     if (savedWarehouse) document.getElementById('warehouseSelect').value = savedWarehouse;
     const savedName = localStorage.getItem('wst_scannerName');
     if (savedName) document.getElementById('scannerNameInput').value = savedName;
+
+    // Remember this sheet's config so a reload doesn't require re-pasting it.
+    localStorage.setItem('wst_sheetUrl', idInput);
+    localStorage.setItem('wst_ordersTab', tabNames.orders);
+    localStorage.setItem('wst_inventoryTab', tabNames.inventory);
+    localStorage.setItem('wst_movementsTab', tabNames.movements);
   } catch (e) {
     setStatus('sheetStatus', 'Error: ' + (e.message || e), 'bad');
   }
-});
+}
+
+document.getElementById('initBtn').addEventListener('click', runInitializeSheet);
 
 document.getElementById('warehouseSelect').addEventListener('change', e => localStorage.setItem('wst_warehouse', e.target.value));
 document.getElementById('scannerNameInput').addEventListener('change', e => localStorage.setItem('wst_scannerName', e.target.value));
@@ -749,13 +810,7 @@ async function performLookup(orderId) {
     const qty = parseFloat(match.qty) || 1;
     resultEl.innerHTML = '<p class="muted">Confirming delivery…</p>';
     await confirmDelivery(match, orderId, warehouse, qty, scannedBy);
-    resultEl.innerHTML = `
-      <div class="banner ok">Delivered automatically — ${orderId}, qty ${qty}, ${warehouse}.</div>
-      <div class="resultCard">
-        <div class="kv"><span class="k">Customer</span><span class="v">${match.customer || '—'}</span></div>
-        <div class="kv"><span class="k">Product</span><span class="v">${match.product || '—'}</span></div>
-        <div class="kv"><span class="k">SKU</span><span class="v">${match.sku || '—'}</span></div>
-      </div>`;
+    resultEl.innerHTML = `<div class="banner ok">Delivered — ${orderId}, qty ${qty}, ${warehouse}${match.customer ? ' — ' + match.customer : ''}.</div>`;
     document.getElementById('orderIdInput').value = '';
     document.getElementById('ocrRawText').textContent = '(none yet)';
     currentMatch = null;
