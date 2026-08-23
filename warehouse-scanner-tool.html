@@ -594,13 +594,23 @@ function guessCustomerLine(text) {
 }
 
 document.getElementById('captureBtn').addEventListener('click', async () => {
-  if (!video.videoWidth) { setStatus('cameraStatus', 'Camera not ready yet.', 'bad'); return; }
-  captureCanvas.width = video.videoWidth;
-  captureCanvas.height = video.videoHeight;
-  captureCanvas.getContext('2d').drawImage(video, 0, 0);
+  const captureBtnEl = document.getElementById('captureBtn');
+  const originalLabel = captureBtnEl.textContent;
+  // Change the button itself immediately, before anything else runs — this
+  // is the cheapest possible proof the tap actually reached this handler,
+  // independent of the status line below (which a slow/stuck OCR call
+  // could otherwise leave looking unchanged for several seconds).
+  captureBtnEl.textContent = 'Capturing…';
+  captureBtnEl.disabled = true;
+  setStatus('cameraStatus', 'Capture button tapped — starting…', '');
 
-  setStatus('cameraStatus', 'Reading label text…', '');
   try {
+    if (!video.videoWidth) { setStatus('cameraStatus', 'Camera not ready yet.', 'bad'); return; }
+    captureCanvas.width = video.videoWidth;
+    captureCanvas.height = video.videoHeight;
+    captureCanvas.getContext('2d').drawImage(video, 0, 0);
+
+    setStatus('cameraStatus', 'Reading label text…', '');
     const worker = await getOcrWorker();
     const { data } = await worker.recognize(captureCanvas);
     const text = data.text || '';
@@ -617,6 +627,9 @@ document.getElementById('captureBtn').addEventListener('click', async () => {
     if (custGuess) setStatus('barcodeStatus', (lastBarcode ? document.getElementById('barcodeStatus').textContent + ' | ' : '') + `Possible name on label: ${custGuess}`, 'warn');
   } catch (e) {
     setStatus('cameraStatus', 'OCR failed: ' + (e.message || e), 'bad');
+  } finally {
+    captureBtnEl.textContent = originalLabel;
+    captureBtnEl.disabled = false;
   }
 });
 
