@@ -548,8 +548,16 @@ document.getElementById('startCameraBtn').addEventListener('click', async () => 
 });
 
 document.getElementById('stopCameraBtn').addEventListener('click', () => {
-  if (zxingControls) { zxingControls.stop(); zxingControls = null; }
-  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (zxingControls) { try { zxingControls.stop(); } catch (e) {} zxingControls = null; }
+  if (zxingReader) { try { zxingReader.reset(); } catch (e) {} zxingReader = null; }
+  // Stop every track actually attached to the <video> right now, not just
+  // the stream we remember opening ourselves — some barcode-scanning
+  // libraries attach their own stream to the element, and stopping only
+  // our own reference leaves that one running (camera stays on).
+  const attachedStream = video.srcObject;
+  if (attachedStream && attachedStream.getTracks) attachedStream.getTracks().forEach(t => t.stop());
+  if (mediaStream && mediaStream !== attachedStream) mediaStream.getTracks().forEach(t => t.stop());
+  mediaStream = null;
   video.srcObject = null;
   document.getElementById('startCameraBtn').disabled = false;
   document.getElementById('stopCameraBtn').disabled = true;
@@ -563,6 +571,18 @@ async function getOcrWorker() {
     ocrWorker = await Tesseract.createWorker('eng');
   }
   return ocrWorker;
+}
+
+// OCR sometimes splits the printed order ID with a stray space or misreads
+// one digit — try the strict match first, then fall back to concatenating
+// every digit run in the text and searching that, which survives spacing
+// artifacts (e.g. "200014 989634170" -> "200014989634170").
+function extractOrderId(text) {
+  const direct = text.match(ORDER_ID_REGEX);
+  if (direct) return direct[0];
+  const digitsOnly = (text.match(/\d+/g) || []).join('');
+  const fallback = digitsOnly.match(ORDER_ID_REGEX);
+  return fallback ? fallback[0] : null;
 }
 
 function guessCustomerLine(text) {
@@ -586,10 +606,10 @@ document.getElementById('captureBtn').addEventListener('click', async () => {
     const text = data.text || '';
     document.getElementById('ocrRawText').textContent = text || '(no text found)';
 
-    const match = text.match(ORDER_ID_REGEX);
+    const match = extractOrderId(text);
     if (match) {
-      document.getElementById('orderIdInput').value = match[0];
-      setStatus('cameraStatus', `Order ID found: ${match[0]}`, 'ok');
+      document.getElementById('orderIdInput').value = match;
+      setStatus('cameraStatus', `Order ID found: ${match}`, 'ok');
     } else {
       setStatus('cameraStatus', 'No 15-digit order ID (2000...) found in the frame — enter it manually below or retake the photo.', 'warn');
     }
