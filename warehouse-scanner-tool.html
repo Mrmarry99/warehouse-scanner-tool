@@ -733,9 +733,38 @@ async function performLookup(orderId) {
       return;
     }
     currentMatch = match;
-    renderLookupResult(match, orderId);
+
+    const alreadyDelivered = /delivered/i.test(match.status);
+    if (alreadyDelivered) {
+      // The one case that still gets a manual tap: re-scanning something
+      // already marked Delivered is exactly the double-scan / wrong-match
+      // scenario worth a human glance before it silently overwrites a real
+      // record — everything else auto-confirms instantly.
+      renderLookupResult(match, orderId);
+      return;
+    }
+
+    const warehouse = document.getElementById('warehouseSelect').value;
+    const scannedBy = document.getElementById('scannerNameInput').value.trim() || '(unnamed)';
+    const qty = parseFloat(match.qty) || 1;
+    resultEl.innerHTML = '<p class="muted">Confirming delivery…</p>';
+    await confirmDelivery(match, orderId, warehouse, qty, scannedBy);
+    resultEl.innerHTML = `
+      <div class="banner ok">Delivered automatically — ${orderId}, qty ${qty}, ${warehouse}.</div>
+      <div class="resultCard">
+        <div class="kv"><span class="k">Customer</span><span class="v">${match.customer || '—'}</span></div>
+        <div class="kv"><span class="k">Product</span><span class="v">${match.product || '—'}</span></div>
+        <div class="kv"><span class="k">SKU</span><span class="v">${match.sku || '—'}</span></div>
+      </div>`;
+    document.getElementById('orderIdInput').value = '';
+    document.getElementById('ocrRawText').textContent = '(none yet)';
+    currentMatch = null;
+    lastBarcode = '';
+    setStatus('barcodeStatus', '', '');
+    // Ready for the next label immediately — no tap needed to get here.
+    if (mediaStream) startAutoScan();
   } catch (e) {
-    resultEl.innerHTML = `<div class="banner bad">Lookup failed: ${e.message || e}</div>`;
+    resultEl.innerHTML = `<div class="banner bad">Lookup/confirm failed: ${e.message || e}</div>`;
     if (mediaStream) startAutoScan();
   }
 }
