@@ -735,6 +735,27 @@ async function runOcrPass(maxWidth) {
 let autoScanTimer = null;
 let autoScanBusy = false;
 
+// After a fresh confirm, the camera is almost always still pointed at the
+// exact same physical label (staff hasn't moved to the next package yet)
+// — without this, auto-scan immediately re-detects that same order ID and
+// throws up an "already Delivered" double-scan warning for the package
+// that was just correctly processed a second ago, forcing a manual Clear
+// every single scan. Suppress re-detection of that specific ID for a short
+// grace window instead; a genuine re-scan later (different moment, or
+// after moving on and coming back) still triggers the real warning.
+let justConfirmedOrderId = null;
+let justConfirmedAt = 0;
+const REPEAT_SUPPRESS_MS = 8000;
+
+function markJustConfirmed(orderId) {
+  justConfirmedOrderId = orderId;
+  justConfirmedAt = Date.now();
+}
+
+function isSuppressed(orderId) {
+  return orderId === justConfirmedOrderId && (Date.now() - justConfirmedAt) < REPEAT_SUPPRESS_MS;
+}
+
 function startAutoScan() {
   stopAutoScan();
   setStatus('cameraStatus', 'Scanning for order ID…', '');
@@ -744,7 +765,11 @@ function startAutoScan() {
     try {
       const { text, match } = await runOcrPass(1000);
       document.getElementById('ocrRawText').textContent = text || '(no text found)';
-      if (match) {
+      if (match && isSuppressed(match)) {
+        // Same label still in frame right after confirming it — ignore
+        // silently and keep scanning, rather than re-triggering a lookup.
+        setStatus('cameraStatus', 'Scanning for order ID…', '');
+      } else if (match) {
         stopAutoScan();
         document.getElementById('orderIdInput').value = match;
         setStatus('cameraStatus', `Order ID found: ${match} — looking up…`, 'ok');
@@ -866,6 +891,7 @@ async function performLookup(orderId) {
     const qty = parseFloat(match.qty) || 1;
     resultEl.innerHTML = '<p class="muted">Confirming delivery…</p>';
     await confirmDelivery(match, orderId, warehouse, qty, scannedBy);
+    markJustConfirmed(orderId);
     playConfirmedSound();
     resultEl.innerHTML = `<div class="banner ok">Delivered — ${orderId}, qty ${qty}, ${warehouse}${match.customer ? ' — ' + match.customer : ''}.</div>`;
     document.getElementById('orderIdInput').value = '';
