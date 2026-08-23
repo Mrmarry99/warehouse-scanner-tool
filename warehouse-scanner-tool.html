@@ -517,7 +517,13 @@ document.getElementById('startCameraBtn').addEventListener('click', async () => 
     return;
   }
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      },
+    });
     video.srcObject = mediaStream;
     document.getElementById('startCameraBtn').disabled = true;
     document.getElementById('stopCameraBtn').disabled = false;
