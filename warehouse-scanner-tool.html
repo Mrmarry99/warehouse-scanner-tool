@@ -144,8 +144,9 @@
       <div class="row">
         <button id="startCameraBtn">Start camera</button>
         <button id="stopCameraBtn" disabled>Stop camera</button>
-        <button id="captureBtn" class="primary" disabled>Capture &amp; read order ID</button>
+        <button id="captureBtn" class="primary" disabled>Scan now</button>
       </div>
+      <p class="sub" style="margin:8px 0 0;">Once the camera's on, it scans automatically in the background — just point it at the label. Tap <strong>Scan now</strong> only to force an immediate retry.</p>
       <video id="video" autoplay playsinline webkit-playsinline muted></video>
       <canvas id="captureCanvas" class="hidden"></canvas>
       <div class="statusLine" id="cameraStatus"></div>
@@ -529,6 +530,7 @@ document.getElementById('startCameraBtn').addEventListener('click', async () => 
     document.getElementById('stopCameraBtn').disabled = false;
     document.getElementById('captureBtn').disabled = false;
     setStatus('cameraStatus', 'Camera running.', 'ok');
+    startAutoScan();
 
     if (window.ZXing) {
       zxingReader = new ZXing.BrowserMultiFormatReader();
@@ -548,6 +550,7 @@ document.getElementById('startCameraBtn').addEventListener('click', async () => 
 });
 
 document.getElementById('stopCameraBtn').addEventListener('click', () => {
+  stopAutoScan();
   if (zxingControls) { try { zxingControls.stop(); } catch (e) {} zxingControls = null; }
   if (zxingReader) { try { zxingReader.reset(); } catch (e) {} zxingReader = null; }
   // Stop every track actually attached to the <video> right now, not just
@@ -569,6 +572,12 @@ async function getOcrWorker() {
   if (!ocrWorker) {
     setStatus('cameraStatus', 'Loading OCR engine…', '');
     ocrWorker = await Tesseract.createWorker('eng');
+    // The only thing this app ever needs to read is the 15-digit order ID —
+    // restricting recognition to digits only is both noticeably faster
+    // (smaller search space per character) and more accurate (no letter/digit
+    // confusion), which matters a lot once OCR is running continuously in a
+    // background loop instead of once per manual tap.
+    await ocrWorker.setParameters({ tessedit_char_whitelist: '0123456789' });
   }
   return ocrWorker;
 }
@@ -585,48 +594,90 @@ function extractOrderId(text) {
   return fallback ? fallback[0] : null;
 }
 
-function guessCustomerLine(text) {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  for (const line of lines) {
-    if (/^[A-Z][A-Z .'-]{4,40}$/.test(line) && !/PEEL|WALMART|FEDEX|TRIP|AMBIENT/i.test(line)) return line;
-  }
-  return '';
+// Grabs the current video frame downscaled to maxWidth (large printed
+// digits don't need full sensor resolution to read, and a smaller image
+// recognizes noticeably faster — important when this runs on a timer).
+function captureFrameForOcr(maxWidth) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = maxWidth && vw > maxWidth ? maxWidth / vw : 1;
+  captureCanvas.width = Math.round(vw * scale);
+  captureCanvas.height = Math.round(vh * scale);
+  captureCanvas.getContext('2d').drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+  return captureCanvas;
 }
 
+async function runOcrPass(maxWidth) {
+  const canvas = captureFrameForOcr(maxWidth);
+  const worker = await getOcrWorker();
+  const { data } = await worker.recognize(canvas);
+  const text = data.text || '';
+  return { text, match: extractOrderId(text) };
+}
+
+// ---- Continuous auto-scan: runs in the background the whole time the
+// camera is on, so staff never have to tap a capture button per label —
+// point the phone at the next order and it picks it up on its own. ----
+let autoScanTimer = null;
+let autoScanBusy = false;
+
+function startAutoScan() {
+  stopAutoScan();
+  setStatus('cameraStatus', 'Scanning for order ID…', '');
+  autoScanTimer = setInterval(async () => {
+    if (autoScanBusy || !mediaStream || !video.videoWidth) return;
+    autoScanBusy = true;
+    try {
+      const { text, match } = await runOcrPass(1000);
+      document.getElementById('ocrRawText').textContent = text || '(no text found)';
+      if (match) {
+        stopAutoScan();
+        document.getElementById('orderIdInput').value = match;
+        setStatus('cameraStatus', `Order ID found: ${match} — looking up…`, 'ok');
+        await performLookup(match);
+      } else {
+        setStatus('cameraStatus', 'Scanning for order ID…', '');
+      }
+    } catch (e) {
+      // A single bad frame shouldn't kill continuous scanning — just retry
+      // on the next tick.
+    }
+    autoScanBusy = false;
+  }, 900);
+}
+
+function stopAutoScan() {
+  if (autoScanTimer) { clearInterval(autoScanTimer); autoScanTimer = null; }
+  autoScanBusy = false;
+}
+
+// Manual override — forces an immediate high-effort attempt right now
+// instead of waiting for the next auto-scan tick, for a label that's
+// proving stubborn. Auto-scan resumes afterward unless a match was found
+// (in which case the lookup result takes over until reviewed).
 document.getElementById('captureBtn').addEventListener('click', async () => {
   const captureBtnEl = document.getElementById('captureBtn');
   const originalLabel = captureBtnEl.textContent;
-  // Change the button itself immediately, before anything else runs — this
-  // is the cheapest possible proof the tap actually reached this handler,
-  // independent of the status line below (which a slow/stuck OCR call
-  // could otherwise leave looking unchanged for several seconds).
-  captureBtnEl.textContent = 'Capturing…';
+  const wasAutoScanning = !!autoScanTimer;
+  stopAutoScan();
+  captureBtnEl.textContent = 'Scanning…';
   captureBtnEl.disabled = true;
-  setStatus('cameraStatus', 'Capture button tapped — starting…', '');
 
   try {
     if (!video.videoWidth) { setStatus('cameraStatus', 'Camera not ready yet.', 'bad'); return; }
-    captureCanvas.width = video.videoWidth;
-    captureCanvas.height = video.videoHeight;
-    captureCanvas.getContext('2d').drawImage(video, 0, 0);
-
     setStatus('cameraStatus', 'Reading label text…', '');
-    const worker = await getOcrWorker();
-    const { data } = await worker.recognize(captureCanvas);
-    const text = data.text || '';
+    const { text, match } = await runOcrPass(1400);
     document.getElementById('ocrRawText').textContent = text || '(no text found)';
-
-    const match = extractOrderId(text);
     if (match) {
       document.getElementById('orderIdInput').value = match;
-      setStatus('cameraStatus', `Order ID found: ${match}`, 'ok');
+      setStatus('cameraStatus', `Order ID found: ${match} — looking up…`, 'ok');
+      await performLookup(match);
     } else {
-      setStatus('cameraStatus', 'No 15-digit order ID (2000...) found in the frame — enter it manually below or retake the photo.', 'warn');
+      setStatus('cameraStatus', 'No 15-digit order ID (2000...) found — try again or enter it manually below.', 'warn');
+      if (wasAutoScanning) startAutoScan();
     }
-    const custGuess = guessCustomerLine(text);
-    if (custGuess) setStatus('barcodeStatus', (lastBarcode ? document.getElementById('barcodeStatus').textContent + ' | ' : '') + `Possible name on label: ${custGuess}`, 'warn');
   } catch (e) {
     setStatus('cameraStatus', 'OCR failed: ' + (e.message || e), 'bad');
+    if (wasAutoScanning) startAutoScan();
   } finally {
     captureBtnEl.textContent = originalLabel;
     captureBtnEl.disabled = false;
@@ -640,6 +691,7 @@ document.getElementById('clearScanBtn').addEventListener('click', () => {
   currentMatch = null;
   lastBarcode = '';
   setStatus('barcodeStatus', '', '');
+  if (mediaStream) startAutoScan();
 });
 
 // ==================================================================
@@ -665,9 +717,8 @@ async function lookupOrder(orderId) {
   return null;
 }
 
-document.getElementById('lookupBtn').addEventListener('click', async () => {
+async function performLookup(orderId) {
   if (!sheetInitialized) { alert('Connect and initialize your sheet first.'); return; }
-  const orderId = document.getElementById('orderIdInput').value.trim();
   const resultEl = document.getElementById('lookupResult');
   if (!orderId) { resultEl.innerHTML = '<div class="banner bad">Enter or scan an order ID first.</div>'; return; }
 
@@ -677,13 +728,20 @@ document.getElementById('lookupBtn').addEventListener('click', async () => {
     if (!match) {
       resultEl.innerHTML = `<div class="banner bad">No matching order found for ${orderId}. Double-check the ID or add it to your sheet.</div>`;
       currentMatch = null;
+      // Nothing to review here — safe to keep scanning for the next label.
+      if (mediaStream) startAutoScan();
       return;
     }
     currentMatch = match;
     renderLookupResult(match, orderId);
   } catch (e) {
     resultEl.innerHTML = `<div class="banner bad">Lookup failed: ${e.message || e}</div>`;
+    if (mediaStream) startAutoScan();
   }
+}
+
+document.getElementById('lookupBtn').addEventListener('click', () => {
+  performLookup(document.getElementById('orderIdInput').value.trim());
 });
 
 function renderLookupResult(match, orderId) {
@@ -720,6 +778,9 @@ function renderLookupResult(match, orderId) {
       currentMatch = null;
       lastBarcode = '';
       setStatus('barcodeStatus', '', '');
+      // Ready for the next label — resume scanning automatically so staff
+      // can just point at the next order without tapping anything.
+      if (mediaStream) startAutoScan();
     } catch (e) {
       setStatus('confirmStatus', 'Error saving: ' + (e.message || e), 'bad');
     }
