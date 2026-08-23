@@ -256,6 +256,59 @@ let ocrWorker = null;
 let currentMatch = null; // { row, sku, customer, product, qty, status, warehouse }
 
 // ==================================================================
+// Audio feedback — three distinct tones so staff can tell the outcome of
+// a scan without looking at the screen. Generated with the Web Audio API
+// rather than sound files, so nothing extra needs to load.
+// ==================================================================
+let audioCtx = null;
+
+function unlockAudio() {
+  // Mobile browsers only allow audio to start from a real user gesture —
+  // "Start camera" is one, so create/resume the context there, well before
+  // any async OCR result tries to play a tone on its own.
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) audioCtx = new Ctx();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function beep(freq, startOffset, duration, type) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'sine';
+  osc.frequency.value = freq;
+  const t0 = audioCtx.currentTime + startOffset;
+  gain.gain.setValueAtTime(0.0001, t0);
+  gain.gain.exponentialRampToValueAtTime(0.3, t0 + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + duration + 0.02);
+}
+
+// Order found, matched, and confirmed Delivered — a bright ascending chime.
+function playConfirmedSound() {
+  beep(880, 0, 0.12, 'sine');
+  beep(1318, 0.1, 0.16, 'sine');
+}
+
+// Order ID read fine, but no matching row in the sheet — a single low buzz.
+function playNotFoundSound() {
+  beep(220, 0, 0.35, 'square');
+}
+
+// Already marked Delivered — the double-scan case — two short low beeps,
+// deliberately different from both of the above so it can't be confused
+// with either a clean success or a plain not-found.
+function playDoubleScanSound() {
+  beep(440, 0, 0.1, 'sawtooth');
+  beep(440, 0.16, 0.1, 'sawtooth');
+}
+
+// ==================================================================
 // Helpers
 // ==================================================================
 function colLetter(n) {
@@ -574,6 +627,7 @@ const video = document.getElementById('video');
 const captureCanvas = document.getElementById('captureCanvas');
 
 document.getElementById('startCameraBtn').addEventListener('click', async () => {
+  unlockAudio();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setStatus('cameraStatus', 'Camera not available in this browser/context.', 'bad');
     return;
@@ -787,6 +841,7 @@ async function performLookup(orderId) {
   try {
     const match = await lookupOrder(orderId);
     if (!match) {
+      playNotFoundSound();
       resultEl.innerHTML = `<div class="banner bad">No matching order found for ${orderId}. Double-check the ID or add it to your sheet.</div>`;
       currentMatch = null;
       // Nothing to review here — safe to keep scanning for the next label.
@@ -801,6 +856,7 @@ async function performLookup(orderId) {
       // already marked Delivered is exactly the double-scan / wrong-match
       // scenario worth a human glance before it silently overwrites a real
       // record — everything else auto-confirms instantly.
+      playDoubleScanSound();
       renderLookupResult(match, orderId);
       return;
     }
@@ -810,6 +866,7 @@ async function performLookup(orderId) {
     const qty = parseFloat(match.qty) || 1;
     resultEl.innerHTML = '<p class="muted">Confirming delivery…</p>';
     await confirmDelivery(match, orderId, warehouse, qty, scannedBy);
+    playConfirmedSound();
     resultEl.innerHTML = `<div class="banner ok">Delivered — ${orderId}, qty ${qty}, ${warehouse}${match.customer ? ' — ' + match.customer : ''}.</div>`;
     document.getElementById('orderIdInput').value = '';
     document.getElementById('ocrRawText').textContent = '(none yet)';
