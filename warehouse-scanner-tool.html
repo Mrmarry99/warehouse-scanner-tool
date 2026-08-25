@@ -596,6 +596,7 @@ async function runInitializeSheet() {
     const savedName = localStorage.getItem('wst_scannerName');
     if (savedName) document.getElementById('scannerNameInput').value = savedName;
 
+    loadOrdersCache();
     await refreshOrdersCache();
     loadPendingQueue();
     flushPendingQueue();
@@ -890,10 +891,25 @@ function mapOrderRows(rows) {
   }));
 }
 
+// Saved to disk (not just memory) so offline lookups keep working even if
+// the page reloads mid-outage — a phone locking/sleeping or the browser
+// reclaiming a background tab is realistic over a long stretch offline.
+function saveOrdersCache() {
+  try { localStorage.setItem('wst_ordersCache', JSON.stringify(ordersCache)); } catch (e) {}
+}
+
+function loadOrdersCache() {
+  try {
+    const raw = localStorage.getItem('wst_ordersCache');
+    if (raw) ordersCache = JSON.parse(raw);
+  } catch (e) {}
+}
+
 async function refreshOrdersCache() {
   try {
     const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
     ordersCache = mapOrderRows(rows);
+    saveOrdersCache();
   } catch (e) {
     // Offline or failed — keep whatever cache we already have rather than
     // wiping it out.
@@ -1022,6 +1038,7 @@ async function lookupOrder(orderId) {
   try {
     const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
     ordersCache = mapOrderRows(rows);
+    saveOrdersCache();
     return ordersCache.find(o => o.orderId === orderId.trim()) || null;
   } catch (e) {
     if (isNetworkError(e) && ordersCache.length) {
