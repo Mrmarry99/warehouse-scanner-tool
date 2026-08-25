@@ -286,7 +286,8 @@ function beep(freq, startOffset, duration, type) {
   osc.frequency.value = freq;
   const t0 = audioCtx.currentTime + startOffset;
   gain.gain.setValueAtTime(0.0001, t0);
-  gain.gain.exponentialRampToValueAtTime(0.3, t0 + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.95, t0 + 0.01);
+  gain.gain.setValueAtTime(0.95, t0 + duration * 0.6);
   gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
   osc.connect(gain);
   gain.connect(audioCtx.destination);
@@ -296,21 +297,21 @@ function beep(freq, startOffset, duration, type) {
 
 // Order found, matched, and confirmed Delivered — a bright ascending chime.
 function playConfirmedSound() {
-  beep(880, 0, 0.12, 'sine');
-  beep(1318, 0.1, 0.16, 'sine');
+  beep(880, 0, 0.18, 'sine');
+  beep(1318, 0.14, 0.24, 'sine');
 }
 
 // Order ID read fine, but no matching row in the sheet — a single low buzz.
 function playNotFoundSound() {
-  beep(220, 0, 0.35, 'square');
+  beep(220, 0, 0.5, 'square');
 }
 
 // Already marked Delivered — the double-scan case — two short low beeps,
 // deliberately different from both of the above so it can't be confused
 // with either a clean success or a plain not-found.
 function playDoubleScanSound() {
-  beep(440, 0, 0.1, 'sawtooth');
-  beep(440, 0.16, 0.1, 'sawtooth');
+  beep(440, 0, 0.16, 'sawtooth');
+  beep(440, 0.22, 0.16, 'sawtooth');
 }
 
 // ==================================================================
@@ -353,7 +354,11 @@ async function sheetsFetch(method, url, body) {
   }
   const res = await fetch(url, opts);
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error?.message || `Sheets API error (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(data.error?.message || `Sheets API error (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -900,6 +905,27 @@ function isNetworkError(e) {
   return !navigator.onLine || msg.includes('failed to fetch') || msg.includes('networkerror') || msg.includes('load failed') || msg.includes('network request failed');
 }
 
+function isAuthError(e) {
+  const msg = ((e && e.message) || String(e)).toLowerCase();
+  return (e && e.status === 401) || msg.includes('invalid authentication') || msg.includes('unauthenticated') || msg.includes('invalid_grant');
+}
+
+// The cached session expired mid-use (not a reload, not offline) — this is
+// its own case, distinct from both "offline" (queue and keep trying) and
+// "bad data" (drop it): nothing will succeed again until a human taps
+// Reconnect, so stop scanning and say so plainly instead of a confusing
+// generic error on whatever scan happened to hit it.
+function handleAuthExpiry() {
+  accessToken = null;
+  localStorage.removeItem('wst_gtoken');
+  sheetInitialized = false;
+  stopAutoScan();
+  document.getElementById('sheetCard').classList.remove('hidden');
+  document.getElementById('connectBtn').textContent = 'Reconnect';
+  setStatus('sheetStatus', '⚠ Your session expired — tap "Reconnect" above to keep scanning.', 'bad');
+  setStatus('cameraStatus', 'Session expired — reconnect above, then resume scanning.', 'bad');
+}
+
 function loadPendingQueue() {
   try { pendingQueue = JSON.parse(localStorage.getItem('wst_pendingQueue') || '[]'); } catch (e) { pendingQueue = []; }
   updatePendingBadge();
@@ -970,7 +996,14 @@ async function flushPendingQueue() {
         remaining.push(...pendingQueue.slice(i));
         break;
       }
-      // A non-network failure (e.g. bad data) — drop it rather than retry forever.
+      if (isAuthError(e)) {
+        // Session expired — keep every remaining item queued (nothing here
+        // is "bad data", the credential just needs refreshing) and stop.
+        remaining.push(...pendingQueue.slice(i));
+        handleAuthExpiry();
+        break;
+      }
+      // A non-network, non-auth failure (e.g. bad data) — drop it rather than retry forever.
     }
   }
   pendingQueue = remaining;
@@ -1055,6 +1088,11 @@ async function performLookup(orderId) {
     // Ready for the next label immediately — no tap needed to get here.
     if (mediaStream) startAutoScan();
   } catch (e) {
+    if (isAuthError(e)) {
+      handleAuthExpiry();
+      resultEl.innerHTML = `<div class="banner bad">Session expired — tap "Reconnect" above, then scan this one again.</div>`;
+      return;
+    }
     resultEl.innerHTML = `<div class="banner bad">Lookup/confirm failed: ${e.message || e}</div>`;
     if (mediaStream) startAutoScan();
   }
@@ -1126,6 +1164,7 @@ document.getElementById('receiveBtn').addEventListener('click', async () => {
     document.getElementById('receiveSku').value = '';
     document.getElementById('receiveRef').value = '';
   } catch (e) {
+    if (isAuthError(e)) { handleAuthExpiry(); setStatus('receiveStatus', 'Session expired — tap "Reconnect" above, then try again.', 'bad'); btn.disabled = false; btn.textContent = 'Receive stock'; return; }
     setStatus('receiveStatus', 'Error: ' + (e.message || e), 'bad');
   }
   btn.disabled = false; btn.textContent = 'Receive stock';
@@ -1150,6 +1189,7 @@ document.getElementById('shipBtn').addEventListener('click', async () => {
     document.getElementById('shipSku').value = '';
     document.getElementById('shipRef').value = '';
   } catch (e) {
+    if (isAuthError(e)) { handleAuthExpiry(); setStatus('shipStatus', 'Session expired — tap "Reconnect" above, then try again.', 'bad'); btn.disabled = false; btn.textContent = 'Ship stock'; return; }
     setStatus('shipStatus', 'Error: ' + (e.message || e), 'bad');
   }
   btn.disabled = false; btn.textContent = 'Ship stock';
@@ -1183,6 +1223,7 @@ async function refreshLevels() {
     html += '</tbody></table>';
     wrap.innerHTML = html;
   } catch (e) {
+    if (isAuthError(e)) { handleAuthExpiry(); wrap.innerHTML = '<p class="banner bad">Session expired — tap "Reconnect" above.</p>'; return; }
     wrap.innerHTML = `<p class="banner bad">Error loading inventory: ${e.message || e}</p>`;
   }
 }
