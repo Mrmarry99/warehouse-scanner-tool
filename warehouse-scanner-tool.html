@@ -106,16 +106,8 @@
   <div class="card" id="sheetCard">
     <div class="row">
       <button id="connectBtn">Connect Google Sheet</button>
-      <input type="password" id="sheetUrlInput" placeholder="Paste your Google Sheet URL or ID" autocomplete="off" style="flex:1; min-width:180px;">
-      <button id="toggleSheetUrlBtn" class="small" type="button" title="Show/hide sheet link">Show</button>
     </div>
-    <div class="row">
-      <label>Orders tab <input type="text" id="ordersTabInput" value="Orders" style="width:110px;"></label>
-      <label>Inventory tab <input type="text" id="inventoryTabInput" value="Inventory" style="width:110px;"></label>
-      <label>Movements tab <input type="text" id="movementsTabInput" value="Movements" style="width:110px;"></label>
-      <button id="initBtn" class="primary" disabled>Connect / Initialize sheet</button>
-    </div>
-    <div class="statusLine" id="sheetStatus">Not connected — click "Connect Google Sheet" to sign in, paste your sheet URL, then Initialize.</div>
+    <div class="statusLine" id="sheetStatus">Not connected — click "Connect Google Sheet" to sign in.</div>
   </div>
 
   <div class="card hidden" id="sessionCard">
@@ -217,6 +209,10 @@
 // ==================================================================
 const SHEETS_CLIENT_ID = '188787222523-bvfdoo4353hcl3mrdua5aohov53nnk0m.apps.googleusercontent.com';
 const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+// Fixed sheet — not user-entered, so it never shows up in the UI. Not a
+// secret (anything in client-side JS is technically viewable via page
+// source), but it does mean nothing sensitive ever appears on screen.
+const FIXED_SHEET_ID = '1aCHdWSn8NRCL1SBmpqzuH80S0Jhewk0C4oOgTHTxdPE';
 
 const WAREHOUSES = ['IL', 'TX', 'NC', 'NJ', 'NY'];
 const ORDER_ID_REGEX = /\b2000\d{11}\b/;
@@ -433,13 +429,15 @@ function initTokenClient() {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: SHEETS_CLIENT_ID,
     scope: SHEETS_SCOPE,
-    callback: (resp) => {
+    callback: async (resp) => {
       if (resp.access_token) {
         accessToken = resp.access_token;
         saveTokenCache(resp);
-        setStatus('sheetStatus', 'Connected — paste your sheet URL, then click Initialize.', 'ok');
         document.getElementById('connectBtn').textContent = 'Reconnect';
-        document.getElementById('initBtn').disabled = false;
+        setStatus('sheetStatus', 'Connected — setting up…', 'ok');
+        // The sheet is fixed, so signing in is the only step — go straight
+        // into initializing it, no separate button or fields needed.
+        await runInitializeSheet();
       }
     },
   });
@@ -454,32 +452,14 @@ document.getElementById('connectBtn').addEventListener('click', () => {
   tokenClient.requestAccessToken();
 });
 
-function restoreSavedSheetConfig() {
-  const savedUrl = localStorage.getItem('wst_sheetUrl');
-  if (savedUrl) document.getElementById('sheetUrlInput').value = savedUrl;
-  const savedOrders = localStorage.getItem('wst_ordersTab');
-  if (savedOrders) document.getElementById('ordersTabInput').value = savedOrders;
-  const savedInv = localStorage.getItem('wst_inventoryTab');
-  if (savedInv) document.getElementById('inventoryTabInput').value = savedInv;
-  const savedMove = localStorage.getItem('wst_movementsTab');
-  if (savedMove) document.getElementById('movementsTabInput').value = savedMove;
-  return !!savedUrl;
-}
-
 window.addEventListener('load', async () => {
   initTokenClient();
-  const hasSheetConfig = restoreSavedSheetConfig();
   const cached = loadTokenCache();
   if (cached) {
     accessToken = cached.access_token;
     document.getElementById('connectBtn').textContent = 'Reconnect';
-    document.getElementById('initBtn').disabled = false;
-    if (hasSheetConfig) {
-      setStatus('sheetStatus', 'Resumed previous sign-in — reconnecting to your sheet…', 'ok');
-      await runInitializeSheet();
-    } else {
-      setStatus('sheetStatus', 'Resumed previous sign-in — paste your sheet URL, then click Initialize.', 'ok');
-    }
+    setStatus('sheetStatus', 'Resumed previous sign-in — setting up…', 'ok');
+    await runInitializeSheet();
   }
 });
 
@@ -570,12 +550,9 @@ async function ensureLogTab(existingTabs, tabName, headerRow) {
 }
 
 async function runInitializeSheet() {
-  const idInput = document.getElementById('sheetUrlInput').value.trim();
-  if (!idInput) { setStatus('sheetStatus', 'Paste your sheet URL or ID first.', 'bad'); return; }
-  spreadsheetId = extractSpreadsheetId(idInput);
-  tabNames.orders = document.getElementById('ordersTabInput').value.trim() || 'Orders';
-  tabNames.inventory = document.getElementById('inventoryTabInput').value.trim() || 'Inventory';
-  tabNames.movements = document.getElementById('movementsTabInput').value.trim() || 'Movements';
+  spreadsheetId = FIXED_SHEET_ID;
+  // Tab names are fixed too — the setup UI (and the sheet link itself)
+  // never needs to be shown once this is running.
 
   setStatus('sheetStatus', 'Checking sheet…', '');
   try {
@@ -604,6 +581,9 @@ async function runInitializeSheet() {
     setStatus('sheetStatus', log.join('\n'), 'ok');
     document.getElementById('sessionCard').classList.remove('hidden');
     document.getElementById('modeTabs').classList.remove('hidden');
+    // Nothing left to configure — hide the whole setup card so the sheet
+    // link and tab names are never sitting visible on screen.
+    document.getElementById('sheetCard').classList.add('hidden');
 
     const savedWarehouse = localStorage.getItem('wst_warehouse');
     if (savedWarehouse) document.getElementById('warehouseSelect').value = savedWarehouse;
@@ -614,18 +594,10 @@ async function runInitializeSheet() {
     await refreshOrdersCache();
     loadPendingQueue();
     flushPendingQueue();
-
-    // Remember this sheet's config so a reload doesn't require re-pasting it.
-    localStorage.setItem('wst_sheetUrl', idInput);
-    localStorage.setItem('wst_ordersTab', tabNames.orders);
-    localStorage.setItem('wst_inventoryTab', tabNames.inventory);
-    localStorage.setItem('wst_movementsTab', tabNames.movements);
   } catch (e) {
     setStatus('sheetStatus', 'Error: ' + (e.message || e), 'bad');
   }
 }
-
-document.getElementById('initBtn').addEventListener('click', runInitializeSheet);
 
 document.getElementById('warehouseSelect').addEventListener('change', e => {
   localStorage.setItem('wst_warehouse', e.target.value);
@@ -637,14 +609,6 @@ function updateWarehouseAutoLabel() {
   const el = document.getElementById('warehouseAutoLabel');
   if (el) el.textContent = 'Warehouse: ' + document.getElementById('warehouseSelect').value;
 }
-
-document.getElementById('toggleSheetUrlBtn').addEventListener('click', () => {
-  const input = document.getElementById('sheetUrlInput');
-  const btn = document.getElementById('toggleSheetUrlBtn');
-  const showing = input.type === 'text';
-  input.type = showing ? 'password' : 'text';
-  btn.textContent = showing ? 'Show' : 'Hide';
-});
 
 // ==================================================================
 // Mode tabs
