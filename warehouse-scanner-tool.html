@@ -208,7 +208,13 @@
 // Config / constants
 // ==================================================================
 const SHEETS_CLIENT_ID = '188787222523-bvfdoo4353hcl3mrdua5aohov53nnk0m.apps.googleusercontent.com';
-const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/userinfo.email';
+// Warehouse is derived from whichever Google account is signed in — no
+// visible picker. Add the other four locations' emails here as they're
+// confirmed; each is a one-line addition.
+const EMAIL_WAREHOUSE_MAP = {
+  'mjahanzeb.research@gmail.com': 'NJ',
+};
 // Fixed sheet — not user-entered, so it never shows up in the UI. Not a
 // secret (anything in client-side JS is technically viewable via page
 // source), but it does mean nothing sensitive ever appears on screen.
@@ -587,7 +593,7 @@ async function runInitializeSheet() {
 
     const savedWarehouse = localStorage.getItem('wst_warehouse');
     if (savedWarehouse) document.getElementById('warehouseSelect').value = savedWarehouse;
-    updateWarehouseAutoLabel();
+    await applyWarehouseFromAccount();
     const savedName = localStorage.getItem('wst_scannerName');
     if (savedName) document.getElementById('scannerNameInput').value = savedName;
 
@@ -604,6 +610,41 @@ document.getElementById('warehouseSelect').addEventListener('change', e => {
   updateWarehouseAutoLabel();
 });
 document.getElementById('scannerNameInput').addEventListener('change', e => localStorage.setItem('wst_scannerName', e.target.value));
+
+async function fetchSignedInEmail() {
+  try {
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: 'Bearer ' + accessToken },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data.email || '').toLowerCase() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Warehouse comes from whichever Google account is signed in — no manual
+// picker. If that account hasn't been mapped yet (rollout still in
+// progress, or someone signs in with the wrong account), fall back to
+// whatever was last used locally rather than hard-blocking the scanner,
+// but make the mismatch clearly visible so it doesn't silently mis-tag data.
+async function applyWarehouseFromAccount() {
+  const email = await fetchSignedInEmail();
+  const mapped = email ? EMAIL_WAREHOUSE_MAP[email] : null;
+  const el = document.getElementById('warehouseAutoLabel');
+  if (mapped) {
+    document.getElementById('warehouseSelect').value = mapped;
+    localStorage.setItem('wst_warehouse', mapped);
+    if (el) { el.innerHTML = `Warehouse: ${mapped}`; el.className = 'statusLine'; }
+  } else {
+    const fallback = document.getElementById('warehouseSelect').value;
+    if (el) {
+      el.innerHTML = `<span class="warn">⚠ ${email || 'This account'} isn't mapped to a warehouse yet — using ${fallback} as a fallback.</span>`;
+      el.className = 'statusLine';
+    }
+  }
+}
 
 function updateWarehouseAutoLabel() {
   const el = document.getElementById('warehouseAutoLabel');
