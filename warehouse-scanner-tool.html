@@ -266,6 +266,7 @@ let currentMatch = null; // { row, sku, customer, product, qty, status, warehous
 // rather than sound files, so nothing extra needs to load.
 // ==================================================================
 let audioCtx = null;
+let audioOut = null; // master gain -> compressor -> speakers
 
 function unlockAudio() {
   // Mobile browsers only allow audio to start from a real user gesture —
@@ -273,32 +274,51 @@ function unlockAudio() {
   // any async OCR result tries to play a tone on its own.
   if (!audioCtx) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (Ctx) audioCtx = new Ctx();
+    if (Ctx) {
+      audioCtx = new Ctx();
+      // A compressor lets the master gain run well past unity (1.0) for
+      // real loudness on a small, quiet phone speaker, while it catches
+      // the peaks so it doesn't just turn into harsh clipped noise —
+      // plain gain alone tops out well before this is actually loud.
+      const compressor = audioCtx.createDynamicsCompressor();
+      compressor.threshold.value = -24;
+      compressor.knee.value = 6;
+      compressor.ratio.value = 12;
+      compressor.attack.value = 0.001;
+      compressor.release.value = 0.15;
+      audioOut = audioCtx.createGain();
+      audioOut.gain.value = 2.2;
+      audioOut.connect(compressor);
+      compressor.connect(audioCtx.destination);
+    }
   }
   if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
 }
 
 function beep(freq, startOffset, duration, type) {
-  if (!audioCtx) return;
+  if (!audioCtx || !audioOut) return;
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   osc.type = type || 'sine';
   osc.frequency.value = freq;
   const t0 = audioCtx.currentTime + startOffset;
   gain.gain.setValueAtTime(0.0001, t0);
-  gain.gain.exponentialRampToValueAtTime(0.95, t0 + 0.01);
-  gain.gain.setValueAtTime(0.95, t0 + duration * 0.6);
+  gain.gain.exponentialRampToValueAtTime(1, t0 + 0.01);
+  gain.gain.setValueAtTime(1, t0 + duration * 0.6);
   gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
   osc.connect(gain);
-  gain.connect(audioCtx.destination);
+  gain.connect(audioOut);
   osc.start(t0);
   osc.stop(t0 + duration + 0.02);
 }
 
 // Order found, matched, and confirmed Delivered — a bright ascending chime.
+// Triangle carries noticeably more perceived loudness than sine at the same
+// amplitude (more harmonic content) while still sounding like a clean tone
+// rather than a buzz, so it stays pleasant on the scan that plays most often.
 function playConfirmedSound() {
-  beep(880, 0, 0.18, 'sine');
-  beep(1318, 0.14, 0.24, 'sine');
+  beep(880, 0, 0.18, 'triangle');
+  beep(1318, 0.14, 0.24, 'triangle');
 }
 
 // Order ID read fine, but no matching row in the sheet — a single low buzz.
