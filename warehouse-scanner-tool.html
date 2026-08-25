@@ -101,11 +101,13 @@
   </header>
 
   <div id="envBanner"></div>
+  <div class="banner warn hidden" id="pendingBadge" style="margin-top:10px;"></div>
 
   <div class="card" id="sheetCard">
     <div class="row">
       <button id="connectBtn">Connect Google Sheet</button>
-      <input type="text" id="sheetUrlInput" placeholder="Paste your Google Sheet URL or ID">
+      <input type="password" id="sheetUrlInput" placeholder="Paste your Google Sheet URL or ID" autocomplete="off" style="flex:1; min-width:180px;">
+      <button id="toggleSheetUrlBtn" class="small" type="button" title="Show/hide sheet link">Show</button>
     </div>
     <div class="row">
       <label>Orders tab <input type="text" id="ordersTabInput" value="Orders" style="width:110px;"></label>
@@ -118,7 +120,11 @@
 
   <div class="card hidden" id="sessionCard">
     <div class="row">
-      <label>Warehouse
+      <!-- Warehouse is no longer picked by hand — it's derived from the
+           signed-in Google account's email once that mapping is wired in.
+           Kept in the DOM (hidden) so the rest of the app's logic, which
+           reads warehouseSelect.value, needs no other changes. -->
+      <label class="hidden" id="warehouseRow">Warehouse
         <select id="warehouseSelect">
           <option value="IL">IL</option>
           <option value="TX">TX</option>
@@ -127,6 +133,7 @@
           <option value="NY">NY</option>
         </select>
       </label>
+      <span class="statusLine" id="warehouseAutoLabel"></span>
       <label>Your name <input type="text" id="scannerNameInput" placeholder="e.g. Umair" style="width:160px;"></label>
     </div>
   </div>
@@ -235,6 +242,8 @@ const INVENTORY_HEADERS = {
   lastMovement: { candidates: ['last movement at', 'last movement'], create: 'Last Movement At' },
 };
 const MOVEMENTS_HEADER_ROW = ['Timestamp', 'SKU', 'Warehouse', 'Type', 'Qty', 'Order ID', 'Scanned By'];
+const NOT_FOUND_HEADER_ROW = ['Timestamp', 'Order ID', 'Warehouse', 'Scanned By'];
+const DUPLICATE_HEADER_ROW = ['Timestamp', 'Order ID', 'SKU', 'Warehouse', 'Scanned By', 'Note'];
 
 // ==================================================================
 // State
@@ -242,7 +251,7 @@ const MOVEMENTS_HEADER_ROW = ['Timestamp', 'SKU', 'Warehouse', 'Type', 'Qty', 'O
 let accessToken = null;
 let tokenClient = null;
 let spreadsheetId = null;
-let tabNames = { orders: 'Orders', inventory: 'Inventory', movements: 'Movements' };
+let tabNames = { orders: 'Orders', inventory: 'Inventory', movements: 'Movements', notFound: 'Not Found', duplicates: 'Duplicates' };
 let ordersCols = null;   // { sku, orderId, customer, product, qty, status, warehouse, deliveredQty, deliveredAt, scannedBy }
 let inventoryCols = null; // { sku, warehouse, qty, lastMovement }
 let sheetInitialized = false;
@@ -548,10 +557,13 @@ async function ensureInventoryTab(existingTabs, tabName) {
   return { log, cols };
 }
 
-async function ensureMovementsTab(existingTabs, tabName) {
+// Shared by every tab that's just an append-only log (Movements, Not Found,
+// Duplicates) — no column-detection needed, just make sure the tab and its
+// header row exist.
+async function ensureLogTab(existingTabs, tabName, headerRow) {
   if (!existingTabs.includes(tabName)) {
     await createTab(tabName);
-    await setHeaderRow(tabName, MOVEMENTS_HEADER_ROW);
+    await setHeaderRow(tabName, headerRow);
     return [`Created "${tabName}" tab with fresh headers.`];
   }
   return [`Using existing "${tabName}" tab.`];
@@ -580,7 +592,13 @@ async function runInitializeSheet() {
     log.push(...invResult.log);
 
     const existingTabs3 = await getSpreadsheetTabs();
-    log.push(...(await ensureMovementsTab(existingTabs3, tabNames.movements)));
+    log.push(...(await ensureLogTab(existingTabs3, tabNames.movements, MOVEMENTS_HEADER_ROW)));
+
+    const existingTabs4 = await getSpreadsheetTabs();
+    log.push(...(await ensureLogTab(existingTabs4, tabNames.notFound, NOT_FOUND_HEADER_ROW)));
+
+    const existingTabs5 = await getSpreadsheetTabs();
+    log.push(...(await ensureLogTab(existingTabs5, tabNames.duplicates, DUPLICATE_HEADER_ROW)));
 
     sheetInitialized = true;
     setStatus('sheetStatus', log.join('\n'), 'ok');
@@ -589,8 +607,13 @@ async function runInitializeSheet() {
 
     const savedWarehouse = localStorage.getItem('wst_warehouse');
     if (savedWarehouse) document.getElementById('warehouseSelect').value = savedWarehouse;
+    updateWarehouseAutoLabel();
     const savedName = localStorage.getItem('wst_scannerName');
     if (savedName) document.getElementById('scannerNameInput').value = savedName;
+
+    await refreshOrdersCache();
+    loadPendingQueue();
+    flushPendingQueue();
 
     // Remember this sheet's config so a reload doesn't require re-pasting it.
     localStorage.setItem('wst_sheetUrl', idInput);
@@ -604,8 +627,24 @@ async function runInitializeSheet() {
 
 document.getElementById('initBtn').addEventListener('click', runInitializeSheet);
 
-document.getElementById('warehouseSelect').addEventListener('change', e => localStorage.setItem('wst_warehouse', e.target.value));
+document.getElementById('warehouseSelect').addEventListener('change', e => {
+  localStorage.setItem('wst_warehouse', e.target.value);
+  updateWarehouseAutoLabel();
+});
 document.getElementById('scannerNameInput').addEventListener('change', e => localStorage.setItem('wst_scannerName', e.target.value));
+
+function updateWarehouseAutoLabel() {
+  const el = document.getElementById('warehouseAutoLabel');
+  if (el) el.textContent = 'Warehouse: ' + document.getElementById('warehouseSelect').value;
+}
+
+document.getElementById('toggleSheetUrlBtn').addEventListener('click', () => {
+  const input = document.getElementById('sheetUrlInput');
+  const btn = document.getElementById('toggleSheetUrlBtn');
+  const showing = input.type === 'text';
+  input.type = showing ? 'password' : 'text';
+  btn.textContent = showing ? 'Show' : 'Hide';
+});
 
 // ==================================================================
 // Mode tabs
@@ -835,26 +874,139 @@ document.getElementById('clearScanBtn').addEventListener('click', () => {
 });
 
 // ==================================================================
+// Offline support — a scan shouldn't be lost just because the warehouse
+// wifi drops. Reads fall back to a locally cached copy of the Orders tab;
+// writes that fail because of no connectivity get queued locally and
+// replayed automatically once the connection comes back.
+// ==================================================================
+let ordersCache = []; // mapped rows, see mapOrderRows()
+let pendingQueue = []; // [{ id, type, payload, ts }]
+
+function mapOrderRows(rows) {
+  return rows.map((row, i) => ({
+    row: i + 2,
+    orderId: (row[ordersCols.orderId - 1] || '').toString().trim(),
+    sku: row[ordersCols.sku - 1] || '',
+    customer: row[ordersCols.customer - 1] || '',
+    product: row[ordersCols.product - 1] || '',
+    qty: row[ordersCols.qty - 1] || '',
+    status: row[ordersCols.status - 1] || '',
+    priorWarehouse: row[ordersCols.warehouse - 1] || '',
+  }));
+}
+
+async function refreshOrdersCache() {
+  try {
+    const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
+    ordersCache = mapOrderRows(rows);
+  } catch (e) {
+    // Offline or failed — keep whatever cache we already have rather than
+    // wiping it out.
+  }
+}
+
+function isNetworkError(e) {
+  const msg = ((e && e.message) || String(e)).toLowerCase();
+  return !navigator.onLine || msg.includes('failed to fetch') || msg.includes('networkerror') || msg.includes('load failed') || msg.includes('network request failed');
+}
+
+function loadPendingQueue() {
+  try { pendingQueue = JSON.parse(localStorage.getItem('wst_pendingQueue') || '[]'); } catch (e) { pendingQueue = []; }
+  updatePendingBadge();
+}
+
+function savePendingQueue() {
+  try { localStorage.setItem('wst_pendingQueue', JSON.stringify(pendingQueue)); } catch (e) {}
+  updatePendingBadge();
+}
+
+function updatePendingBadge() {
+  const el = document.getElementById('pendingBadge');
+  if (!el) return;
+  if (pendingQueue.length) {
+    el.textContent = `⏳ ${pendingQueue.length} scan${pendingQueue.length === 1 ? '' : 's'} waiting to sync — offline or connection trouble. Keep scanning, nothing is lost.`;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
+
+// Runs a write immediately; if it fails for what looks like a connectivity
+// reason, queues it for later instead of losing the scan. Returns true if
+// it synced right away, false if it got queued.
+async function runOrQueue(type, payload, runFn) {
+  try {
+    await runFn();
+    return true;
+  } catch (e) {
+    if (isNetworkError(e)) {
+      pendingQueue.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2), type, payload, ts: Date.now() });
+      savePendingQueue();
+      return false;
+    }
+    throw e;
+  }
+}
+
+async function replayPendingItem(item) {
+  if (item.type === 'confirm') {
+    const { orderId, warehouse, scannedBy } = item.payload;
+    const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
+    const match = mapOrderRows(rows).find(o => o.orderId === orderId);
+    if (!match) return; // row no longer there — nothing sensible to replay
+    const qty = parseFloat(match.qty) || 1;
+    await confirmDelivery(match, orderId, warehouse, qty, scannedBy);
+  } else if (item.type === 'notFound') {
+    const { orderId, warehouse, scannedBy } = item.payload;
+    await appendRow(tabNames.notFound, [new Date(item.ts).toLocaleString(), orderId, warehouse, scannedBy]);
+  } else if (item.type === 'duplicate') {
+    const { orderId, sku, warehouse, scannedBy, note } = item.payload;
+    await appendRow(tabNames.duplicates, [new Date(item.ts).toLocaleString(), orderId, sku, warehouse, scannedBy, note]);
+  }
+}
+
+let flushingQueue = false;
+async function flushPendingQueue() {
+  if (flushingQueue || !pendingQueue.length || !accessToken || !sheetInitialized || !navigator.onLine) return;
+  flushingQueue = true;
+  const remaining = [];
+  for (let i = 0; i < pendingQueue.length; i++) {
+    const item = pendingQueue[i];
+    try {
+      await replayPendingItem(item);
+    } catch (e) {
+      if (isNetworkError(e)) {
+        // Still offline — keep this and everything after it for next time.
+        remaining.push(...pendingQueue.slice(i));
+        break;
+      }
+      // A non-network failure (e.g. bad data) — drop it rather than retry forever.
+    }
+  }
+  pendingQueue = remaining;
+  savePendingQueue();
+  flushingQueue = false;
+  if (pendingQueue.length === 0) await refreshOrdersCache();
+}
+
+window.addEventListener('online', flushPendingQueue);
+setInterval(flushPendingQueue, 20000);
+
+// ==================================================================
 // Order lookup + confirm delivery
 // ==================================================================
 async function lookupOrder(orderId) {
-  const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const val = (row[ordersCols.orderId - 1] || '').toString().trim();
-    if (val === orderId.trim()) {
-      return {
-        row: i + 2,
-        sku: row[ordersCols.sku - 1] || '',
-        customer: row[ordersCols.customer - 1] || '',
-        product: row[ordersCols.product - 1] || '',
-        qty: row[ordersCols.qty - 1] || '',
-        status: row[ordersCols.status - 1] || '',
-        priorWarehouse: row[ordersCols.warehouse - 1] || '',
-      };
+  try {
+    const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
+    ordersCache = mapOrderRows(rows);
+    return ordersCache.find(o => o.orderId === orderId.trim()) || null;
+  } catch (e) {
+    if (isNetworkError(e) && ordersCache.length) {
+      const found = ordersCache.find(o => o.orderId === orderId.trim());
+      return found ? Object.assign({}, found, { fromCache: true }) : null;
     }
+    throw e;
   }
-  return null;
 }
 
 async function performLookup(orderId) {
@@ -863,13 +1015,18 @@ async function performLookup(orderId) {
   if (!orderId) { resultEl.innerHTML = '<div class="banner bad">Enter or scan an order ID first.</div>'; return; }
 
   resultEl.innerHTML = '<p class="muted">Looking up…</p>';
+  const warehouse = document.getElementById('warehouseSelect').value;
+  const scannedBy = document.getElementById('scannerNameInput').value.trim() || '(unnamed)';
+
   try {
     const match = await lookupOrder(orderId);
     if (!match) {
       playNotFoundSound();
-      resultEl.innerHTML = `<div class="banner bad">No matching order found for ${orderId}. Double-check the ID or add it to your sheet.</div>`;
+      const synced = await runOrQueue('notFound', { orderId, warehouse, scannedBy }, () =>
+        appendRow(tabNames.notFound, [new Date().toLocaleString(), orderId, warehouse, scannedBy]));
+      resultEl.innerHTML = `<div class="banner bad">Not found — ${orderId} logged to "Not Found"${synced ? '' : ' (queued — offline)'}. Add it to your sheet when you get a chance.</div>`;
       currentMatch = null;
-      // Nothing to review here — safe to keep scanning for the next label.
+      markJustConfirmed(orderId); // don't spam the same miss while it's still in frame
       if (mediaStream) startAutoScan();
       return;
     }
@@ -877,23 +1034,29 @@ async function performLookup(orderId) {
 
     const alreadyDelivered = /delivered/i.test(match.status);
     if (alreadyDelivered) {
-      // The one case that still gets a manual tap: re-scanning something
-      // already marked Delivered is exactly the double-scan / wrong-match
-      // scenario worth a human glance before it silently overwrites a real
-      // record — everything else auto-confirms instantly.
+      // Never blocks for a manual tap and never touches the original
+      // Delivered record — a duplicate/double-scan just gets logged to its
+      // own tab for later review, so nothing stops the scanning flow and
+      // nothing gets silently overwritten either.
       playDoubleScanSound();
-      renderLookupResult(match, orderId);
+      const note = `Already Delivered${match.priorWarehouse ? ' at ' + match.priorWarehouse : ''}`;
+      const synced = await runOrQueue('duplicate', { orderId, sku: match.sku, warehouse, scannedBy, note }, () =>
+        appendRow(tabNames.duplicates, [new Date().toLocaleString(), orderId, match.sku, warehouse, scannedBy, note]));
+      resultEl.innerHTML = `<div class="banner warn">Duplicate — ${orderId} ${note.toLowerCase()}. Logged to "Duplicates"${synced ? '' : ' (queued — offline)'}, original record untouched.</div>`;
+      markJustConfirmed(orderId);
+      if (mediaStream) startAutoScan();
       return;
     }
 
-    const warehouse = document.getElementById('warehouseSelect').value;
-    const scannedBy = document.getElementById('scannerNameInput').value.trim() || '(unnamed)';
     const qty = parseFloat(match.qty) || 1;
     resultEl.innerHTML = '<p class="muted">Confirming delivery…</p>';
-    await confirmDelivery(match, orderId, warehouse, qty, scannedBy);
+    const synced = await runOrQueue('confirm', { orderId, warehouse, scannedBy }, () =>
+      confirmDelivery(match, orderId, warehouse, qty, scannedBy));
     markJustConfirmed(orderId);
     playConfirmedSound();
-    resultEl.innerHTML = `<div class="banner ok">Delivered — ${orderId}, qty ${qty}, ${warehouse}${match.customer ? ' — ' + match.customer : ''}.</div>`;
+    resultEl.innerHTML = synced
+      ? `<div class="banner ok">Delivered — ${orderId}, qty ${qty}, ${warehouse}${match.customer ? ' — ' + match.customer : ''}.</div>`
+      : `<div class="banner warn">Delivered (queued — offline) — ${orderId}, qty ${qty}, ${warehouse}. Will sync automatically once back online.</div>`;
     document.getElementById('orderIdInput').value = '';
     document.getElementById('ocrRawText').textContent = '(none yet)';
     currentMatch = null;
@@ -910,50 +1073,6 @@ async function performLookup(orderId) {
 document.getElementById('lookupBtn').addEventListener('click', () => {
   performLookup(document.getElementById('orderIdInput').value.trim());
 });
-
-function renderLookupResult(match, orderId) {
-  const resultEl = document.getElementById('lookupResult');
-  const alreadyDelivered = /delivered/i.test(match.status);
-  const warehouse = document.getElementById('warehouseSelect').value;
-  const scannedBy = document.getElementById('scannerNameInput').value.trim() || '(unnamed)';
-
-  resultEl.innerHTML = `
-    ${alreadyDelivered ? `<div class="banner warn">Already marked Delivered${match.priorWarehouse ? ' at ' + match.priorWarehouse : ''}. Confirming again will overwrite the previous record — double-check before proceeding.</div>` : ''}
-    <div class="resultCard">
-      <div class="kv"><span class="k">Order ID</span><span class="v">${orderId}</span></div>
-      <div class="kv"><span class="k">Customer</span><span class="v">${match.customer || '—'}</span></div>
-      <div class="kv"><span class="k">Product</span><span class="v">${match.product || '—'}</span></div>
-      <div class="kv"><span class="k">SKU</span><span class="v">${match.sku || '—'}</span></div>
-      <div class="kv"><span class="k">Status</span><span class="v">${match.status || '—'}</span></div>
-    </div>
-    <div class="field"><label>Quantity to mark delivered</label><input type="number" id="confirmQty" min="0" value="${match.qty || 1}"></div>
-    <div class="row" style="margin-top:8px;">
-      <button id="confirmDeliverBtn" class="primary">Confirm Delivered</button>
-    </div>
-    <div class="statusLine" id="confirmStatus"></div>
-  `;
-
-  document.getElementById('confirmDeliverBtn').addEventListener('click', async () => {
-    const qty = parseFloat(document.getElementById('confirmQty').value) || 0;
-    const btn = document.getElementById('confirmDeliverBtn');
-    btn.disabled = true; btn.textContent = 'Saving…';
-    try {
-      await confirmDelivery(match, orderId, warehouse, qty, scannedBy);
-      setStatus('confirmStatus', `Saved — ${orderId} marked Delivered (qty ${qty}) at ${warehouse}.`, 'ok');
-      document.getElementById('orderIdInput').value = '';
-      document.getElementById('ocrRawText').textContent = '(none yet)';
-      currentMatch = null;
-      lastBarcode = '';
-      setStatus('barcodeStatus', '', '');
-      // Ready for the next label — resume scanning automatically so staff
-      // can just point at the next order without tapping anything.
-      if (mediaStream) startAutoScan();
-    } catch (e) {
-      setStatus('confirmStatus', 'Error saving: ' + (e.message || e), 'bad');
-    }
-    btn.disabled = false; btn.textContent = 'Confirm Delivered';
-  });
-}
 
 async function confirmDelivery(match, orderId, warehouse, qty, scannedBy) {
   const now = new Date().toLocaleString();
