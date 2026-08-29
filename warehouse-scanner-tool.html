@@ -97,7 +97,7 @@
   <header>
     <p class="eyebrow">Warehouse ops &middot; camera scanner &middot; build 2026-08-23-a</p>
     <h1>Warehouse inventory scanner</h1>
-    <p class="sub">Scan a Walmart shipping label with your phone camera to mark an order Delivered against your Google Sheet order database, plus simple Receive/Ship logging to track stock on hand per warehouse (IL, TX, NC, NJ, NY).</p>
+    <p class="sub">Scan a Walmart shipping label with your phone camera to mark an order Delivered against your Google Sheet order database, plus simple Receive/Ship logging to track stock on hand per warehouse (IL, TX, NC, NJ, NY, SGL).</p>
   </header>
 
   <div id="envBanner"></div>
@@ -123,6 +123,7 @@
           <option value="NC">NC</option>
           <option value="NJ">NJ</option>
           <option value="NY">NY</option>
+          <option value="SGL">SGL (Sugar Land, TX)</option>
         </select>
       </label>
       <span class="statusLine" id="warehouseAutoLabel"></span>
@@ -214,7 +215,7 @@ const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 // source), but it does mean nothing sensitive ever appears on screen.
 const FIXED_SHEET_ID = '1aCHdWSn8NRCL1SBmpqzuH80S0Jhewk0C4oOgTHTxdPE';
 
-const WAREHOUSES = ['IL', 'TX', 'NC', 'NJ', 'NY'];
+const WAREHOUSES = ['IL', 'TX', 'NC', 'NJ', 'NY', 'SGL'];
 const ORDER_ID_REGEX = /\b2000\d{11}\b/;
 
 const ORDER_BASE_HEADERS = {
