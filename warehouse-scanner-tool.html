@@ -1150,6 +1150,7 @@ async function performLookup(orderId) {
       // be sitting in this warehouse's own stock tab already. Check there
       // too, and update it if so, rather than only ever flagging it missing.
       let stockTabHit = false;
+      let stockTabError = '';
       const whenStr = new Date().toLocaleString();
       try {
         const stockSynced = await runOrQueue('warehouseSync', { orderId, warehouse, scannedBy, when: whenStr }, async () => {
@@ -1157,12 +1158,13 @@ async function performLookup(orderId) {
         });
         if (!stockSynced) stockTabHit = false; // queued offline — can't know yet, don't claim either way
       } catch (e) {
-        console.warn('Warehouse stock-sheet check skipped:', e.message || e);
+        stockTabError = e.message || String(e);
+        console.warn('Warehouse stock-sheet check skipped:', stockTabError);
       }
 
       resultEl.innerHTML = stockTabHit
         ? `<div class="banner warn">${orderId} wasn't in the master sheet yet, but it WAS found and marked Delivered in the ${warehouse} stock tab. Also logged to "Not Found" so the master sheet gets caught up.</div>`
-        : `<div class="banner bad">Not found — ${orderId} logged to "Not Found"${notFoundSynced ? '' : ' (queued — offline)'}. Add it to your sheet when you get a chance.</div>`;
+        : `<div class="banner bad">Not found — ${orderId} logged to "Not Found"${notFoundSynced ? '' : ' (queued — offline)'}. Add it to your sheet when you get a chance.${stockTabError ? `<br><br>⚠ Stock-tab check also failed: ${stockTabError}` : ''}</div>`;
       currentMatch = null;
       markJustConfirmed(orderId); // don't spam the same miss while it's still in frame
       if (mediaStream) startAutoScan();
