@@ -230,6 +230,10 @@
         <button id="backfillSyncBtn" class="small">Sync existing Delivered orders</button>
       </div>
     </div>
+    <div class="card">
+      <p class="sub">Reconcile "Not Found": re-checks everything already logged as Not Found against its warehouse's stock tab, in case it was added there since. No manual order-ID typing needed. Safe to run more than once.</p>
+      <div class="row"><button id="reconcileNotFoundBtn" class="small">Reconcile Not Found entries</button></div>
+    </div>
   </div>
 
   <footer id="footerNote"></footer>
@@ -1320,6 +1324,37 @@ async function backfillWarehouseSync(warehouse) {
   alert(`Backfill done for ${warehouse}: ${synced} synced, ${failed} failed (see console for details). Orders not present in the stock sheet are silently skipped.`);
 }
 
+// Walks the whole "Not Found" log and re-checks every entry against its
+// warehouse's stock tab — the same check that already runs live on every
+// new scan, just applied retroactively to the backlog that piled up before
+// a warehouse was configured (or before this feature existed). Safe to run
+// more than once; only warehouses with a configured stock sheet are acted
+// on, everything else is left alone.
+async function reconcileNotFoundWithStockTabs() {
+  const rows = await getValues(tabNames.notFound, 'A2:ZZ100000');
+  const entries = rows
+    .map(r => ({ ts: r[0] || '', orderId: (r[1] || '').toString().trim(), warehouse: (r[2] || '').toString().trim(), scannedBy: r[3] || '(unknown)' }))
+    .filter(e => e.orderId && WAREHOUSE_SHEETS[e.warehouse]);
+
+  if (!entries.length) {
+    alert('No "Not Found" entries for a warehouse that has a stock sheet configured yet.');
+    return;
+  }
+  if (!confirm(`Check ${entries.length} "Not Found" entr${entries.length === 1 ? 'y' : 'ies'} against their warehouse stock tabs now?`)) return;
+
+  let resolved = 0, stillMissing = 0, failed = 0;
+  for (const e of entries) {
+    try {
+      const hit = await syncToWarehouseStockTab(e.orderId, e.warehouse, e.scannedBy, e.ts || new Date().toLocaleString());
+      if (hit) resolved++; else stillMissing++;
+    } catch (err) {
+      failed++;
+      console.warn('Reconcile failed for', e.orderId, err.message || err);
+    }
+  }
+  alert(`Reconcile done: ${resolved} found and marked Delivered in their stock tab, ${stillMissing} still not found anywhere, ${failed} failed (see console).`);
+}
+
 async function confirmDelivery(match, orderId, warehouse, qty, scannedBy) {
   const now = new Date().toLocaleString();
   await updateCellsBatch([
@@ -1458,6 +1493,18 @@ document.getElementById('backfillSyncBtn').addEventListener('click', async () =>
     alert('Backfill failed: ' + (e.message || e));
   }
   btn.disabled = false; btn.textContent = 'Sync existing Delivered orders';
+});
+
+document.getElementById('reconcileNotFoundBtn').addEventListener('click', async () => {
+  if (!sheetInitialized) { alert('Connect and initialize your sheet first.'); return; }
+  const btn = document.getElementById('reconcileNotFoundBtn');
+  btn.disabled = true; btn.textContent = 'Reconciling…';
+  try {
+    await reconcileNotFoundWithStockTabs();
+  } catch (e) {
+    alert('Reconcile failed: ' + (e.message || e));
+  }
+  btn.disabled = false; btn.textContent = 'Reconcile Not Found entries';
 });
 
 // ==================================================================
