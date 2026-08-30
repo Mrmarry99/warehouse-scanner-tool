@@ -265,6 +265,25 @@ const MOVEMENTS_HEADER_ROW = ['Timestamp', 'SKU', 'Warehouse', 'Type', 'Qty', 'O
 const NOT_FOUND_HEADER_ROW = ['Timestamp', 'Order ID', 'Warehouse', 'Scanned By'];
 const DUPLICATE_HEADER_ROW = ['Timestamp', 'Order ID', 'SKU', 'Warehouse', 'Scanned By', 'Note'];
 
+// --- Per-warehouse stock-sheet sync (opt-in, one warehouse at a time) ---
+// Each warehouse's own monthly "stock" tab has a FIXED column layout (given
+// by the user, not auto-detected the way the master Orders tab is):
+//   A Date · B Picture · C Item Details · D Order Name · E SKU · F Order ID
+//   G Deliver Date · H Status · I Order Quantity · J Stock QTY (untouched —
+//   reserved for manual use) · K Sender · L WH Confirmation
+//   M Scan Date (added) · N Warehouse (added)
+const STOCK_TAB_COLS = { orderId: 6, status: 8, whConfirmation: 12, scanDate: 13, warehouseCode: 14 };
+const MONTH_NAMES = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+
+// Add a warehouse here once its sheet is set up and tested — everything
+// else (tab resolution, sync logic) is already generic across all of them.
+const WAREHOUSE_SHEETS = {
+  SGL: {
+    sheetId: '', // TODO: paste the Sugar Land TX Warehouse sheet ID once confirmed
+    currentTab: 'Stock Prism', // update this each month if the naming isn't automatically detected below
+  },
+};
+
 // ==================================================================
 // State
 // ==================================================================
@@ -406,30 +425,34 @@ async function sheetsFetch(method, url, body) {
   return data;
 }
 
-async function getValues(tab, range) {
+async function getValues(tab, range, sheetId) {
+  const id = sheetId || spreadsheetId;
   const r = encodeURIComponent(`${tab}!${range}`);
-  const data = await sheetsFetch('GET', `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${r}`);
+  const data = await sheetsFetch('GET', `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${r}`);
   return data.values || [];
 }
 
-async function updateCellsBatch(updates) {
+async function updateCellsBatch(updates, sheetId) {
   // updates: [{ tab, row, col, value }]
+  const id = sheetId || spreadsheetId;
   const data = updates.map(u => ({ range: `${u.tab}!${colLetter(u.col)}${u.row}`, values: [[u.value]] }));
-  await sheetsFetch('POST', `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
+  await sheetsFetch('POST', `https://sheets.googleapis.com/v4/spreadsheets/${id}/values:batchUpdate`, {
     valueInputOption: 'USER_ENTERED', data,
   });
 }
 
-async function appendRow(tab, rowValues) {
+async function appendRow(tab, rowValues, sheetId) {
+  const id = sheetId || spreadsheetId;
   const r = encodeURIComponent(`${tab}!A1`);
   await sheetsFetch('POST',
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${r}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${r}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
     { values: [rowValues] });
 }
 
-async function getSpreadsheetTabs() {
+async function getSpreadsheetTabs(sheetId) {
+  const id = sheetId || spreadsheetId;
   const data = await sheetsFetch('GET',
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties.title`);
+    `https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=sheets.properties.title`);
   return (data.sheets || []).map(s => s.properties.title);
 }
 
@@ -1038,6 +1061,9 @@ async function replayPendingItem(item) {
   } else if (item.type === 'duplicate') {
     const { orderId, sku, warehouse, scannedBy, note } = item.payload;
     await appendRow(tabNames.duplicates, [new Date(item.ts).toLocaleString(), orderId, sku, warehouse, scannedBy, note]);
+  } else if (item.type === 'warehouseSync') {
+    const { orderId, warehouse, scannedBy, when } = item.payload;
+    await syncToWarehouseStockTab(orderId, warehouse, scannedBy, when);
   }
 }
 
@@ -1136,6 +1162,19 @@ async function performLookup(orderId) {
     resultEl.innerHTML = '<p class="muted">Confirming delivery…</p>';
     const synced = await runOrQueue('confirm', { orderId, warehouse, scannedBy }, () =>
       confirmDelivery(match, orderId, warehouse, qty, scannedBy));
+
+    // Best-effort secondary sync into the warehouse's own stock sheet — the
+    // master Orders sheet above is already the source of truth, so a
+    // problem here (missing tab, changed layout) never blocks or fails the
+    // actual delivery confirmation, just gets noted quietly.
+    const whenStr = new Date().toLocaleString();
+    try {
+      await runOrQueue('warehouseSync', { orderId, warehouse, scannedBy, when: whenStr }, () =>
+        syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr));
+    } catch (e) {
+      console.warn('Warehouse stock-sheet sync skipped:', e.message || e);
+    }
+
     markJustConfirmed(orderId);
     playConfirmedSound();
     resultEl.innerHTML = synced
@@ -1162,6 +1201,58 @@ async function performLookup(orderId) {
 document.getElementById('lookupBtn').addEventListener('click', () => {
   performLookup(document.getElementById('orderIdInput').value.trim());
 });
+
+// Finds which tab in a warehouse's stock sheet represents "now": the
+// explicitly configured name first (most reliable), falling back to a tab
+// whose name contains the current month's full name or 3-letter
+// abbreviation if the configured one is missing or stale. Returns null if
+// neither works — the caller decides what to do rather than guessing.
+function resolveStockTabName(cfg, existingTabs) {
+  if (cfg.currentTab && existingTabs.includes(cfg.currentTab)) return cfg.currentTab;
+  const now = new Date();
+  const full = MONTH_NAMES[now.getMonth()];
+  const abbr = full.slice(0, 3);
+  const guess = existingTabs.find(t => {
+    const lower = t.toLowerCase();
+    return lower.includes(full) || lower.includes(abbr);
+  });
+  return guess || null;
+}
+
+// Best-effort secondary write into a warehouse's own stock sheet — never
+// the source of truth (the master Orders sheet already is), so a failure
+// here shouldn't block or fail the actual delivery confirmation. Silently
+// does nothing if this warehouse isn't configured yet (WAREHOUSE_SHEETS),
+// so rolling this out to more warehouses later is just adding an entry.
+async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
+  const cfg = WAREHOUSE_SHEETS[warehouse];
+  if (!cfg || !cfg.sheetId) return;
+
+  const existingTabs = await getSpreadsheetTabs(cfg.sheetId);
+  const tabName = resolveStockTabName(cfg, existingTabs);
+  if (!tabName) {
+    throw new Error(`Could not find this month's stock tab in the ${warehouse} sheet (looked for "${cfg.currentTab}" or a tab named after the current month).`);
+  }
+
+  // Sanity-check the layout before writing — a changed sheet should fail
+  // loudly here, not silently write into the wrong columns.
+  const headerRow = (await getValues(tabName, '1:1', cfg.sheetId))[0] || [];
+  const orderIdHeader = (headerRow[STOCK_TAB_COLS.orderId - 1] || '').toString().trim().toLowerCase();
+  if (!orderIdHeader.includes('order id')) {
+    throw new Error(`"${tabName}" in the ${warehouse} sheet doesn't look like the expected stock tab (column F isn't "Order ID") — skipped rather than risk writing to the wrong place.`);
+  }
+
+  const rows = await getValues(tabName, 'A2:N100000', cfg.sheetId);
+  const rowIndex = rows.findIndex(r => (r[STOCK_TAB_COLS.orderId - 1] || '').toString().trim() === orderId.trim());
+  if (rowIndex === -1) return; // this order isn't in this warehouse's stock tab — nothing to update
+
+  await updateCellsBatch([
+    { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.status, value: 'Delivered' },
+    { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.whConfirmation, value: scannedBy },
+    { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.scanDate, value: whenStr },
+    { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.warehouseCode, value: warehouse },
+  ], cfg.sheetId);
+}
 
 async function confirmDelivery(match, orderId, warehouse, qty, scannedBy) {
   const now = new Date().toLocaleString();
