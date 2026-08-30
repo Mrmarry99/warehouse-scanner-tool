@@ -225,6 +225,11 @@
       <p class="sub">One-time catch-up: syncs orders already marked Delivered in the master sheet into a warehouse's stock sheet — for orders scanned before that warehouse's sync was set up. Safe to run more than once.</p>
       <div class="row">
         <select id="backfillWarehouseSelect">
+          <option value="IL">IL</option>
+          <option value="TX">TX</option>
+          <option value="NC">NC</option>
+          <option value="NJ">NJ</option>
+          <option value="NY">NY</option>
           <option value="SGL">SGL — Sugar Land, TX</option>
         </select>
         <button id="backfillSyncBtn" class="small">Sync existing Delivered orders</button>
@@ -634,7 +639,21 @@ async function ensureLogTab(existingTabs, tabName, headerRow) {
   return [`Using existing "${tabName}" tab.`];
 }
 
+let initializingSheet = false;
 async function runInitializeSheet() {
+  // Guards against a rare but real race: the page's own load-time
+  // auto-reconnect and a manual tap of "Reconnect" landing at nearly the
+  // same moment would otherwise run this whole sequence twice concurrently.
+  if (initializingSheet) return;
+  initializingSheet = true;
+  try {
+    await runInitializeSheetInner();
+  } finally {
+    initializingSheet = false;
+  }
+}
+
+async function runInitializeSheetInner() {
   spreadsheetId = FIXED_SHEET_ID;
   // Tab names are fixed too — the setup UI (and the sheet link itself)
   // never needs to be shown once this is running.
@@ -1309,7 +1328,7 @@ async function backfillWarehouseSync(warehouse) {
   if (!targets.length) { alert(`No Delivered orders found for ${warehouse} in the master sheet.`); return; }
   if (!confirm(`Sync ${targets.length} already-Delivered ${warehouse} order(s) into the stock sheet now?`)) return;
 
-  let synced = 0, skipped = 0, failed = 0;
+  let synced = 0, failed = 0;
   for (const o of targets) {
     try {
       const whenStr = o.deliveredAt || new Date().toLocaleString();
