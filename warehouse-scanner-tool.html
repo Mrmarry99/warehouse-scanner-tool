@@ -221,6 +221,15 @@
       <div class="row"><button id="refreshLevelsBtn" class="primary">Refresh</button></div>
       <div id="levelsTableWrap"><p class="muted">Click Refresh to load current stock on hand.</p></div>
     </div>
+    <div class="card">
+      <p class="sub">One-time catch-up: syncs orders already marked Delivered in the master sheet into a warehouse's stock sheet — for orders scanned before that warehouse's sync was set up. Safe to run more than once.</p>
+      <div class="row">
+        <select id="backfillWarehouseSelect">
+          <option value="SGL">SGL — Sugar Land, TX</option>
+        </select>
+        <button id="backfillSyncBtn" class="small">Sync existing Delivered orders</button>
+      </div>
+    </div>
   </div>
 
   <footer id="footerNote"></footer>
@@ -955,6 +964,8 @@ function mapOrderRows(rows) {
     qty: row[ordersCols.qty - 1] || '',
     status: row[ordersCols.status - 1] || '',
     priorWarehouse: row[ordersCols.warehouse - 1] || '',
+    deliveredAt: row[ordersCols.deliveredAt - 1] || '',
+    scannedBy: row[ordersCols.scannedBy - 1] || '',
   }));
 }
 
@@ -1254,6 +1265,37 @@ async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
   ], cfg.sheetId);
 }
 
+// One-time catch-up for orders that were already marked Delivered before
+// the sync above existed (or before this warehouse was configured) — finds
+// every Delivered order for this warehouse in the master sheet and syncs
+// each into the stock sheet, using each order's ORIGINAL scan time/name
+// rather than "now", so the stock sheet reflects when it actually happened.
+async function backfillWarehouseSync(warehouse) {
+  const cfg = WAREHOUSE_SHEETS[warehouse];
+  if (!cfg || !cfg.sheetId) { alert('No stock sheet configured for warehouse ' + warehouse + ' yet.'); return; }
+
+  const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
+  const targets = mapOrderRows(rows).filter(o =>
+    o.orderId && o.priorWarehouse === warehouse && /delivered/i.test(o.status));
+
+  if (!targets.length) { alert(`No Delivered orders found for ${warehouse} in the master sheet.`); return; }
+  if (!confirm(`Sync ${targets.length} already-Delivered ${warehouse} order(s) into the stock sheet now?`)) return;
+
+  let synced = 0, skipped = 0, failed = 0;
+  for (const o of targets) {
+    try {
+      const whenStr = o.deliveredAt || new Date().toLocaleString();
+      const scannedBy = o.scannedBy || '(unknown)';
+      await syncToWarehouseStockTab(o.orderId, warehouse, scannedBy, whenStr);
+      synced++;
+    } catch (e) {
+      failed++;
+      console.warn('Backfill sync failed for', o.orderId, e.message || e);
+    }
+  }
+  alert(`Backfill done for ${warehouse}: ${synced} synced, ${failed} failed (see console for details). Orders not present in the stock sheet are silently skipped.`);
+}
+
 async function confirmDelivery(match, orderId, warehouse, qty, scannedBy) {
   const now = new Date().toLocaleString();
   await updateCellsBatch([
@@ -1380,6 +1422,19 @@ async function refreshLevels() {
   }
 }
 document.getElementById('refreshLevelsBtn').addEventListener('click', refreshLevels);
+
+document.getElementById('backfillSyncBtn').addEventListener('click', async () => {
+  if (!sheetInitialized) { alert('Connect and initialize your sheet first.'); return; }
+  const btn = document.getElementById('backfillSyncBtn');
+  const warehouse = document.getElementById('backfillWarehouseSelect').value;
+  btn.disabled = true; btn.textContent = 'Syncing…';
+  try {
+    await backfillWarehouseSync(warehouse);
+  } catch (e) {
+    alert('Backfill failed: ' + (e.message || e));
+  }
+  btn.disabled = false; btn.textContent = 'Sync existing Delivered orders';
+});
 
 // ==================================================================
 // Env banner
