@@ -1332,15 +1332,26 @@ async function backfillWarehouseSync(warehouse) {
 // on, everything else is left alone.
 async function reconcileNotFoundWithStockTabs() {
   const rows = await getValues(tabNames.notFound, 'A2:ZZ100000');
-  const entries = rows
+  const rawEntries = rows
     .map(r => ({ ts: r[0] || '', orderId: (r[1] || '').toString().trim(), warehouse: (r[2] || '').toString().trim(), scannedBy: r[3] || '(unknown)' }))
     .filter(e => e.orderId && WAREHOUSE_SHEETS[e.warehouse]);
+
+  // The same order can get logged more than once if staff scanned it
+  // repeatedly before it existed anywhere — dedupe by Order ID so it's only
+  // checked once, keeping the most recent scan attempt's info (later rows
+  // overwrite earlier ones for the same ID, since the log is append-only
+  // and therefore already in chronological order).
+  const byOrderId = new Map();
+  rawEntries.forEach(e => byOrderId.set(e.orderId, e));
+  const entries = Array.from(byOrderId.values());
+  const duplicateCount = rawEntries.length - entries.length;
 
   if (!entries.length) {
     alert('No "Not Found" entries for a warehouse that has a stock sheet configured yet.');
     return;
   }
-  if (!confirm(`Check ${entries.length} "Not Found" entr${entries.length === 1 ? 'y' : 'ies'} against their warehouse stock tabs now?`)) return;
+  const dupNote = duplicateCount ? ` (${duplicateCount} duplicate re-scan${duplicateCount === 1 ? '' : 's'} of the same order ID skipped)` : '';
+  if (!confirm(`Check ${entries.length} unique "Not Found" order(s) against their warehouse stock tabs now?${dupNote}`)) return;
 
   let resolved = 0, stillMissing = 0, failed = 0;
   for (const e of entries) {
