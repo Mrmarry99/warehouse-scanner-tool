@@ -1143,9 +1143,26 @@ async function performLookup(orderId) {
     const match = await lookupOrder(orderId);
     if (!match) {
       playNotFoundSound();
-      const synced = await runOrQueue('notFound', { orderId, warehouse, scannedBy }, () =>
+      const notFoundSynced = await runOrQueue('notFound', { orderId, warehouse, scannedBy }, () =>
         appendRow(tabNames.notFound, [new Date().toLocaleString(), orderId, warehouse, scannedBy]));
-      resultEl.innerHTML = `<div class="banner bad">Not found — ${orderId} logged to "Not Found"${synced ? '' : ' (queued — offline)'}. Add it to your sheet when you get a chance.</div>`;
+
+      // The master sheet may just be behind — the order can still genuinely
+      // be sitting in this warehouse's own stock tab already. Check there
+      // too, and update it if so, rather than only ever flagging it missing.
+      let stockTabHit = false;
+      const whenStr = new Date().toLocaleString();
+      try {
+        const stockSynced = await runOrQueue('warehouseSync', { orderId, warehouse, scannedBy, when: whenStr }, async () => {
+          stockTabHit = await syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr);
+        });
+        if (!stockSynced) stockTabHit = false; // queued offline — can't know yet, don't claim either way
+      } catch (e) {
+        console.warn('Warehouse stock-sheet check skipped:', e.message || e);
+      }
+
+      resultEl.innerHTML = stockTabHit
+        ? `<div class="banner warn">${orderId} wasn't in the master sheet yet, but it WAS found and marked Delivered in the ${warehouse} stock tab. Also logged to "Not Found" so the master sheet gets caught up.</div>`
+        : `<div class="banner bad">Not found — ${orderId} logged to "Not Found"${notFoundSynced ? '' : ' (queued — offline)'}. Add it to your sheet when you get a chance.</div>`;
       currentMatch = null;
       markJustConfirmed(orderId); // don't spam the same miss while it's still in frame
       if (mediaStream) startAutoScan();
@@ -1235,9 +1252,13 @@ function resolveStockTabName(cfg, existingTabs) {
 // here shouldn't block or fail the actual delivery confirmation. Silently
 // does nothing if this warehouse isn't configured yet (WAREHOUSE_SHEETS),
 // so rolling this out to more warehouses later is just adding an entry.
+// Returns true if a matching row was actually found and updated, false if
+// there was nothing to do (warehouse not configured, or order not in this
+// warehouse's stock tab) — callers use this to tell "synced" apart from
+// "nothing there to sync" rather than treating both the same.
 async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
   const cfg = WAREHOUSE_SHEETS[warehouse];
-  if (!cfg || !cfg.sheetId) return;
+  if (!cfg || !cfg.sheetId) return false;
 
   const existingTabs = await getSpreadsheetTabs(cfg.sheetId);
   const tabName = resolveStockTabName(cfg, existingTabs);
@@ -1255,7 +1276,7 @@ async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
 
   const rows = await getValues(tabName, 'A2:N100000', cfg.sheetId);
   const rowIndex = rows.findIndex(r => (r[STOCK_TAB_COLS.orderId - 1] || '').toString().trim() === orderId.trim());
-  if (rowIndex === -1) return; // this order isn't in this warehouse's stock tab — nothing to update
+  if (rowIndex === -1) return false; // this order isn't in this warehouse's stock tab — nothing to update
 
   await updateCellsBatch([
     { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.status, value: 'Delivered' },
@@ -1263,6 +1284,7 @@ async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
     { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.scanDate, value: whenStr },
     { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.warehouseCode, value: warehouse },
   ], cfg.sheetId);
+  return true;
 }
 
 // One-time catch-up for orders that were already marked Delivered before
