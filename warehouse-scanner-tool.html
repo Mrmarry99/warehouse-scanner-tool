@@ -1273,19 +1273,28 @@ document.getElementById('lookupBtn').addEventListener('click', () => {
 
 // Finds which tab in a warehouse's stock sheet represents "now": the
 // explicitly configured name first (most reliable), falling back to a tab
-// whose name contains the current month's full name or 3-letter
-// abbreviation if the configured one is missing or stale. Returns null if
-// neither works — the caller decides what to do rather than guessing.
+// name if the configured one is missing or stale. The fallback requires
+// BOTH the current month's name/abbreviation AND a keyword taken from the
+// configured base name (e.g. "stock"/"prism") — matching on the month
+// alone isn't safe once a sheet has more than one monthly-tab series in it
+// (e.g. a "Temu September" tab living alongside "Stock Prism September" —
+// both contain "september", so month-only matching would be a coin flip
+// between them). Returns null if there's no match, or more than one
+// candidate still matches — ambiguous cases fail loudly rather than guess,
+// since writing to the wrong tab is worse than writing to none.
 function resolveStockTabName(cfg, existingTabs) {
   if (cfg.currentTab && existingTabs.includes(cfg.currentTab)) return cfg.currentTab;
   const now = new Date();
   const full = MONTH_NAMES[now.getMonth()];
   const abbr = full.slice(0, 3);
-  const guess = existingTabs.find(t => {
+  const baseWords = (cfg.currentTab || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  const candidates = existingTabs.filter(t => {
     const lower = t.toLowerCase();
-    return lower.includes(full) || lower.includes(abbr);
+    const hasMonth = lower.includes(full) || lower.includes(abbr);
+    const hasBaseWord = baseWords.some(w => lower.includes(w));
+    return hasMonth && hasBaseWord;
   });
-  return guess || null;
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
 // Best-effort secondary write into a warehouse's own stock sheet — never
