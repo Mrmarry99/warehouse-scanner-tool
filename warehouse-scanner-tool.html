@@ -295,27 +295,26 @@ const MONTH_NAMES = ['january','february','march','april','may','june','july','a
 
 // Add a warehouse here once its sheet is set up and tested — everything
 // else (tab resolution, sync logic) is already generic across all of them.
+// Each warehouse maps to a LIST of stock sheets, not just one — some
+// warehouses (SGL, NY, IL) have two people each keeping their own separate
+// copy, so a scan there needs to update both. Most warehouses just have one
+// entry in the list, which behaves exactly as before.
 const WAREHOUSE_SHEETS = {
-  SGL: {
-    sheetId: '1buZuarSQZQaBlydYvfVnZzgcoaj6Y2F61ioEF3E7UKs', // Sugar Land TX Warehouse
-    currentTab: 'Stock Prism', // update this each month if the naming isn't automatically detected below
-  },
-  NJ: {
-    sheetId: '10rzZuBOsOlWvu1LkMf09DAae81IJQuffHNu1C5aoBQc', // NJ Warehouse
-    currentTab: 'Stock Prism',
-  },
-  NY: {
-    sheetId: '1J5b7Ll3Hp-lG16gihwtFdGtOfRSaaQvASpuNCY-opd0', // NY Warehouse
-    currentTab: 'Stock Prism',
-  },
-  TX: {
-    sheetId: '1h5MlObQZYDXaVq6l6HzsAbeFbEiq3M1k7Et22-l0rLk', // Dallas, TX Warehouse
-    currentTab: 'Stock Prism',
-  },
-  IL: {
-    sheetId: '1YBlpqEu9bdm_g63UJ2wFCEcfLBhgUoMZKGrdCPYFt2w', // IL Warehouse
-    currentTab: 'Stock Prism',
-  },
+  SGL: [
+    { sheetId: '1buZuarSQZQaBlydYvfVnZzgcoaj6Y2F61ioEF3E7UKs', currentTab: 'Stock Prism' }, // Sugar Land TX Warehouse
+  ],
+  NJ: [
+    { sheetId: '10rzZuBOsOlWvu1LkMf09DAae81IJQuffHNu1C5aoBQc', currentTab: 'Stock Prism' }, // NJ Warehouse
+  ],
+  NY: [
+    { sheetId: '1J5b7Ll3Hp-lG16gihwtFdGtOfRSaaQvASpuNCY-opd0', currentTab: 'Stock Prism' }, // NY Warehouse
+  ],
+  TX: [
+    { sheetId: '1h5MlObQZYDXaVq6l6HzsAbeFbEiq3M1k7Et22-l0rLk', currentTab: 'Stock Prism' }, // Dallas, TX Warehouse
+  ],
+  IL: [
+    { sheetId: '1YBlpqEu9bdm_g63UJ2wFCEcfLBhgUoMZKGrdCPYFt2w', currentTab: 'Stock Prism' }, // IL Warehouse
+  ],
 };
 
 // ==================================================================
@@ -1297,23 +1296,16 @@ function resolveStockTabName(cfg, existingTabs) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
-// Best-effort secondary write into a warehouse's own stock sheet — never
-// the source of truth (the master Orders sheet already is), so a failure
-// here shouldn't block or fail the actual delivery confirmation. Silently
-// does nothing if this warehouse isn't configured yet (WAREHOUSE_SHEETS),
-// so rolling this out to more warehouses later is just adding an entry.
-// Returns true if a matching row was actually found and updated, false if
-// there was nothing to do (warehouse not configured, or order not in this
-// warehouse's stock tab) — callers use this to tell "synced" apart from
-// "nothing there to sync" rather than treating both the same.
-async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
-  const cfg = WAREHOUSE_SHEETS[warehouse];
-  if (!cfg || !cfg.sheetId) return false;
-
+// Does the actual find-and-update against ONE stock sheet.
+// Returns true if a matching row was found and updated, false if the order
+// just isn't in this particular sheet (not an error — the caller may have
+// more sheets to check), throws for a real problem (missing tab, changed
+// layout, network/auth issues).
+async function syncToOneStockSheet(cfg, warehouse, orderId, scannedBy, whenStr) {
   const existingTabs = await getSpreadsheetTabs(cfg.sheetId);
   const tabName = resolveStockTabName(cfg, existingTabs);
   if (!tabName) {
-    throw new Error(`Could not find this month's stock tab in the ${warehouse} sheet (looked for "${cfg.currentTab}" or a tab named after the current month).`);
+    throw new Error(`Could not find this month's stock tab in a ${warehouse} sheet (looked for "${cfg.currentTab}" or a tab named after the current month).`);
   }
 
   // Sanity-check the layout before writing — a changed sheet should fail
@@ -1321,12 +1313,12 @@ async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
   const headerRow = (await getValues(tabName, '1:1', cfg.sheetId))[0] || [];
   const orderIdHeader = (headerRow[STOCK_TAB_COLS.orderId - 1] || '').toString().trim().toLowerCase();
   if (!orderIdHeader.includes('order id')) {
-    throw new Error(`"${tabName}" in the ${warehouse} sheet doesn't look like the expected stock tab (column F isn't "Order ID") — skipped rather than risk writing to the wrong place.`);
+    throw new Error(`"${tabName}" in a ${warehouse} sheet doesn't look like the expected stock tab (column F isn't "Order ID") — skipped rather than risk writing to the wrong place.`);
   }
 
   const rows = await getValues(tabName, 'A2:N100000', cfg.sheetId);
   const rowIndex = rows.findIndex(r => (r[STOCK_TAB_COLS.orderId - 1] || '').toString().trim() === orderId.trim());
-  if (rowIndex === -1) return false; // this order isn't in this warehouse's stock tab — nothing to update
+  if (rowIndex === -1) return false; // this order isn't in this sheet — nothing to update here
 
   await updateCellsBatch([
     { tab: tabName, row: rowIndex + 2, col: STOCK_TAB_COLS.status, value: 'Delivered' },
@@ -1337,14 +1329,41 @@ async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
   return true;
 }
 
+// Best-effort secondary write into a warehouse's stock sheet(s) — never the
+// source of truth (the master Orders sheet already is), so a failure here
+// shouldn't block or fail the actual delivery confirmation. A warehouse can
+// map to more than one sheet (e.g. two people each keeping their own copy)
+// — every configured sheet gets checked and updated independently, so one
+// person's sheet having an issue never stops the other's from syncing.
+// Returns true if AT LEAST ONE sheet had a matching row that got updated;
+// false if none did; throws only if every sheet failed with a real error
+// (so it still gets queued/retried offline, same as the single-sheet case).
+async function syncToWarehouseStockTab(orderId, warehouse, scannedBy, whenStr) {
+  const cfgs = WAREHOUSE_SHEETS[warehouse];
+  if (!cfgs || !cfgs.length) return false;
+
+  let anyHit = false;
+  const errors = [];
+  for (const cfg of cfgs) {
+    try {
+      const hit = await syncToOneStockSheet(cfg, warehouse, orderId, scannedBy, whenStr);
+      if (hit) anyHit = true;
+    } catch (e) {
+      errors.push(e);
+    }
+  }
+  if (!anyHit && errors.length) throw errors[0];
+  return anyHit;
+}
+
 // One-time catch-up for orders that were already marked Delivered before
 // the sync above existed (or before this warehouse was configured) — finds
 // every Delivered order for this warehouse in the master sheet and syncs
 // each into the stock sheet, using each order's ORIGINAL scan time/name
 // rather than "now", so the stock sheet reflects when it actually happened.
 async function backfillWarehouseSync(warehouse) {
-  const cfg = WAREHOUSE_SHEETS[warehouse];
-  if (!cfg || !cfg.sheetId) { alert('No stock sheet configured for warehouse ' + warehouse + ' yet.'); return; }
+  const cfgs = WAREHOUSE_SHEETS[warehouse];
+  if (!cfgs || !cfgs.length) { alert('No stock sheet configured for warehouse ' + warehouse + ' yet.'); return; }
 
   const rows = await getValues(tabNames.orders, 'A2:ZZ100000');
   const targets = mapOrderRows(rows).filter(o =>
@@ -1378,7 +1397,7 @@ async function reconcileNotFoundWithStockTabs() {
   const rows = await getValues(tabNames.notFound, 'A2:ZZ100000');
   const rawEntries = rows
     .map(r => ({ ts: r[0] || '', orderId: (r[1] || '').toString().trim(), warehouse: (r[2] || '').toString().trim(), scannedBy: r[3] || '(unknown)' }))
-    .filter(e => e.orderId && WAREHOUSE_SHEETS[e.warehouse]);
+    .filter(e => e.orderId && WAREHOUSE_SHEETS[e.warehouse] && WAREHOUSE_SHEETS[e.warehouse].length);
 
   // The same order can get logged more than once if staff scanned it
   // repeatedly before it existed anywhere — dedupe by Order ID so it's only
